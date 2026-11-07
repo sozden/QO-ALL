@@ -82,6 +82,25 @@ impl Default for StationConfig {
 }
 
 impl StationConfig {
+    /// Sets the sample rate and the frequencies that suit it. At 2.4 MS/s the receiver
+    /// sits below the transponder and the transmit LO below the uplink, so their spurs
+    /// stay outside. At the low rates (FIR filters in the radio, for Ethernet links) the
+    /// band is too narrow for that: both go on the middle beacon, where nobody
+    /// transmits; the image of the own signal then lands mirrored around it, some 40 dB
+    /// down.
+    pub fn with_rate(mut self, rate: f64) -> Self {
+        self.sample_rate = rate;
+        if rate < crate::iio::FIR_RATE_LIMIT {
+            self.rx_center_hz = crate::bandplan::BEACONS_HZ[1];
+            self.tx_lo_hz = crate::bandplan::uplink(crate::bandplan::BEACONS_HZ[1]);
+        } else {
+            let d = Self::default();
+            self.rx_center_hz = d.rx_center_hz;
+            self.tx_lo_hz = d.tx_lo_hz;
+        }
+        self
+    }
+
     /// Receiver frequency the radio is tuned to (IF).
     pub fn center_if(&self) -> f64 {
         self.rx_center_hz - self.lnb_lo_hz
@@ -564,6 +583,21 @@ mod tests {
     }
 
     #[test]
+    fn low_rate_fits_the_transponder() {
+        use crate::bandplan::{RESERVED_HZ, UPLINK_HIGH_HZ, UPLINK_LOW_HZ, downlink};
+        let c = StationConfig::default().with_rate(1.2e6);
+        // The transponder within ±0.45 of the rate around the centre.
+        assert!(10_490.01e6 - c.rx_center_hz < 0.45 * c.sample_rate);
+        assert!(c.rx_center_hz - 10_489.49e6 < 0.45 * c.sample_rate);
+        // DC and the transmit LO's leakage fall where nobody transmits.
+        let (a, b) = RESERVED_HZ[1];
+        assert!((a..b).contains(&c.rx_center_hz) && (a..b).contains(&downlink(c.tx_lo_hz)));
+        let reach = c.sample_rate / 2.0 - TX_EDGE_HZ;
+        assert!(UPLINK_HIGH_HZ - c.tx_lo_hz < reach && c.tx_lo_hz - UPLINK_LOW_HZ < reach);
+        assert_eq!(c.with_rate(2.4e6), StationConfig::default());
+    }
+
+    #[test]
     fn default_band_fits_the_transponder() {
         let c = StationConfig::default();
         let lo = c.rx_center_hz - c.sample_rate / 2.0;
@@ -583,7 +617,9 @@ mod tests {
     #[test]
     #[ignore]
     fn station_on_simulator() {
-        let config = StationConfig { microphone: Some("none".into()), speaker: Some("none".into()), ..Default::default() };
+        // QOALL_RATE=1.2e6 tries the low-rate set-up.
+        let rate = std::env::var("QOALL_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.4e6);
+        let config = StationConfig { microphone: Some("none".into()), speaker: Some("none".into()), ..Default::default() }.with_rate(rate);
         let listen = ListenSettings { dial_hz: 0.0, mode: Mode::Usb, bandwidth_hz: 2.4e3, audio_rate: 48e3, volume: 1.0 };
         let engine = Engine::start(config, listen, TxSettings::default(), 0.5, || {});
         let started = Instant::now();
@@ -621,7 +657,7 @@ mod tests {
             }
         }
         println!("tx status {:?}", engine.tx_status.lock().unwrap());
-        assert!(engine.tx_status.lock().unwrap().sent_rate > 2.3e6, "the radio is fed in real time");
+        assert!(engine.tx_status.lock().unwrap().sent_rate > 0.95 * rate, "the radio is fed in real time");
         let f = last.expect("frame");
         let peak = f.db.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         let at = f.lo_hz + (peak.0 as f64 + 0.5) / f.db.len() as f64 * (f.hi_hz - f.lo_hz);

@@ -28,6 +28,41 @@ fn tx_buffer_samples(rate: f64) -> usize {
 const FULL_SCALE: f32 = 2048.0;
 /// The DAC takes 12-bit samples in the top bits of 16: full scale is ±32767.
 const TX_FULL_SCALE: f32 = 32767.0;
+/// Below this sample rate the AD936x needs its FIR filters, decimating and interpolating
+/// by four (S/s).
+pub const FIR_RATE_LIMIT: f64 = 2_083_334.0;
+/// Taps of the low-rate FIR filters.
+const FIR_TAPS: usize = 128;
+
+/// Filter configuration for rates below `FIR_RATE_LIMIT`, in the AD936x filter file
+/// format: decimation and interpolation by four, a low-pass passing ±0.45 of the output
+/// rate. Each line holds the transmit, then the receive coefficient. The receive filter
+/// has a gain of 2 with the chip's -6 dB; the transmit filter a gain of 4 (×0.9), making
+/// up for the three zeros the interpolation puts between samples.
+pub fn low_rate_fir() -> String {
+    let n = FIR_TAPS;
+    // Cut-off in cycles per sample at four times the output rate: 0.55 of the output
+    // rate's Nyquist band edge (0.5 / 4 × 1.1).
+    let cutoff = 0.5 / 4.0 * 1.1;
+    let mid = (n - 1) as f64 / 2.0;
+    let h: Vec<f64> = (0..n)
+        .map(|i| {
+            let k = i as f64 - mid;
+            let sinc = if k == 0.0 { 2.0 * cutoff } else { (2.0 * std::f64::consts::PI * cutoff * k).sin() / (std::f64::consts::PI * k) };
+            let x = 2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64;
+            sinc * (0.42 - 0.5 * x.cos() + 0.08 * (2.0 * x).cos())
+        })
+        .collect();
+    let sum: f64 = h.iter().sum();
+    let scale = |gain: f64| -> Vec<i32> { h.iter().map(|v| (v / sum * gain * 32_768.0).round() as i32).collect() };
+    let (tx, rx) = (scale(4.0 * 0.9), scale(2.0 * 0.95));
+    let mut out = String::from("RX 3 GAIN -6 DEC 4\nTX 3 GAIN 0 INT 4\n");
+    for (t, r) in tx.iter().zip(&rx) {
+        out += &format!("{t},{r}\n");
+    }
+    out
+}
+
 /// Transmit attenuation range of the AD9361 (dB).
 pub const TX_ATTENUATION_MAX: f64 = 89.75;
 /// Network and USB operations give up after this long (ms).
@@ -288,21 +323,11 @@ impl IioRadio {
         if [rx_config, rx_lo, i, q].iter().any(|c| c.is_null()) {
             return Err(format!("{uri}: receiver channels not found"));
         }
-        // A FIR filter left loaded by another program (SDR-Console, for its own rate)
-        // tilted QODA's transmitted signal by 5 dB; without it the AD936x still reaches
-        // 2.083 MS/s and more. The Pluto refuses to switch off the transmit filter alone,
-        // so both go off together; failing that, each on its own.
-        let fir_warning = shared.write_device(phy, "in_out_voltage_filter_fir_en", "0").err().and_then(|both| {
-            let tx_config = shared.channel(phy, "voltage0", true);
-            let rx = shared.write(rx_config, "filter_fir_en", "0");
-            let tx = if tx_config.is_null() { Ok(()) } else { shared.write(tx_config, "filter_fir_en", "0") };
-            (rx.is_err() || tx.is_err()).then(|| format!("FIR filter left on ({both})"))
-        });
         Ok(Self {
             shared,
             uri: uri.to_string(),
             phy,
-            fir_warning,
+            fir_warning: None,
             rx_config,
             rx_lo,
             rx,
@@ -339,7 +364,29 @@ impl IioRadio {
     /// sample rate: when narrower, signals near the band edge are attenuated. The AD936x
     /// has one sample rate: it is also the transmitter's.
     pub fn set_sample_rate(&mut self, rate: f64) -> Result<(), String> {
-        self.shared.write(self.rx_config, "sampling_frequency", &format!("{}", rate.round() as i64))?;
+        let s = Arc::clone(&self.shared);
+        let (phy, rx_config) = (self.phy, self.rx_config);
+        let set_rate = || s.write(rx_config, "sampling_frequency", &format!("{}", rate.round() as i64));
+        if rate < FIR_RATE_LIMIT {
+            // Our own decimating/interpolating filters, then the rate they allow.
+            s.write_device(phy, "filter_fir_config", &low_rate_fir()).map_err(|e| format!("FIR filter not accepted: {e}"))?;
+            s.write_device(phy, "in_out_voltage_filter_fir_en", "1")
+                .and_then(|_| set_rate())
+                .or_else(|_| set_rate().and_then(|_| s.write_device(phy, "in_out_voltage_filter_fir_en", "1")))
+                .map_err(|e| format!("{:.2} MS/s with the FIR filter: {e}", rate / 1e6))?;
+            self.fir_warning = None;
+        } else {
+            // A FIR filter left loaded by another program (SDR-Console, for its own rate)
+            // cut off part of the band. The Pluto refuses to switch off the transmit
+            // filter alone, so both go off together; failing that, each on its own.
+            self.fir_warning = s.write_device(phy, "in_out_voltage_filter_fir_en", "0").err().and_then(|both| {
+                let tx_config = s.channel(phy, "voltage0", true);
+                let rx = s.write(rx_config, "filter_fir_en", "0");
+                let tx = if tx_config.is_null() { Ok(()) } else { s.write(tx_config, "filter_fir_en", "0") };
+                (rx.is_err() || tx.is_err()).then(|| format!("FIR filter left on ({both})"))
+            });
+            set_rate()?;
+        }
         let bandwidth = rate.clamp(200_000.0, 56_000_000.0);
         self.shared.write(self.rx_config, "rf_bandwidth", &format!("{}", bandwidth.round() as i64))?;
         if buffer_samples(rate) != buffer_samples(self.rate) && !self.buffer.is_null() {
@@ -579,6 +626,27 @@ mod tests {
         assert_eq!(parse_range("[70000000 1 6000000000]"), Some((70e6, 6e9)));
         assert_eq!(parse_range("[2083333 1 61440000]"), Some((2_083_333.0, 61.44e6)));
         assert_eq!(parse_range("garbage"), None);
+    }
+
+    #[test]
+    fn low_rate_fir_file() {
+        let text = low_rate_fir();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "RX 3 GAIN -6 DEC 4");
+        assert_eq!(lines[1], "TX 3 GAIN 0 INT 4");
+        let taps: Vec<(i32, i32)> = lines[2..]
+            .iter()
+            .map(|l| {
+                let (t, r) = l.split_once(',').unwrap();
+                (t.parse().unwrap(), r.parse().unwrap())
+            })
+            .collect();
+        assert_eq!(taps.len(), 128);
+        assert!(taps.iter().all(|&(t, r)| t.abs() < 32_768 && r.abs() < 32_768));
+        let (tx, rx): (i32, i32) = (taps.iter().map(|t| t.0).sum(), taps.iter().map(|t| t.1).sum());
+        assert!((tx - 117_965).abs() < 100 && (rx - 62_259).abs() < 100, "{tx} {rx}");
+        // Symmetric (linear phase).
+        assert!((0..64).all(|i| taps[i] == taps[127 - i]));
     }
 
     #[test]

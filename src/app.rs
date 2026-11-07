@@ -104,6 +104,7 @@ pub struct App {
     edit_lnb_mhz: f64,
     edit_gain: f64,
     edit_auto_gain: bool,
+    edit_rate: f64,
     edit_mic: Option<String>,
     edit_speaker: Option<String>,
     usb_found: Vec<(String, String)>,
@@ -131,6 +132,8 @@ impl App {
             _ => DeviceChoice::Simulator,
         };
         let defaults = StationConfig::default();
+        // Ethernet links carry too little for 2.4 MS/s both ways: the low rate there.
+        let rate = s.get("sample_rate").unwrap_or(if matches!(device, DeviceChoice::Iio(ref u) if u.starts_with("ip:")) { 1.2e6 } else { 2.4e6 });
         let config = StationConfig {
             device,
             lnb_lo_hz: s.get("lnb_lo_hz").unwrap_or(defaults.lnb_lo_hz),
@@ -138,7 +141,8 @@ impl App {
             microphone: s.text("microphone"),
             speaker: s.text("speaker"),
             ..defaults
-        };
+        }
+        .with_rate(rate);
         let logo = qo_all::logo::rgba(96, false);
         let logo = cc.egui_ctx.load_texture("logo", ColorImage::from_rgba_unmultiplied([96, 96], &logo), TextureOptions::LINEAR);
         // LSB is not used on QO-100: a saved LSB becomes USB.
@@ -193,6 +197,7 @@ impl App {
             edit_lnb_mhz: config.lnb_lo_hz / 1e6,
             edit_gain: config.rx_gain.unwrap_or(40.0),
             edit_auto_gain: config.rx_gain.is_none(),
+            edit_rate: config.sample_rate,
             edit_mic: config.microphone.clone(),
             edit_speaker: config.speaker.clone(),
             usb_found: Vec::new(),
@@ -378,6 +383,7 @@ impl App {
         );
         s.set("last_uri", &self.edit_uri);
         s.set("lnb_lo_hz", self.config.lnb_lo_hz);
+        s.set("sample_rate", self.config.sample_rate);
         s.set("rx_auto_gain", self.config.rx_gain.is_none());
         s.set("rx_gain", self.config.rx_gain.unwrap_or(self.edit_gain));
         s.set_opt("microphone", self.config.microphone.as_ref());
@@ -841,6 +847,16 @@ impl App {
                 TxState::Blocked(_) => RX,
             };
             ui.label(RichText::new(state).size(12.0).color(color));
+            let rate = self.config.sample_rate;
+            if status.state == TxState::Transmit && status.sent_rate > 0.0 && status.sent_rate < rate * 0.9 {
+                let text = format!(
+                    "{} {:.2}/{:.2} MS/s",
+                    self.t("The link is too slow:", "Bağlantı yetmiyor:"),
+                    status.sent_rate / 1e6,
+                    rate / 1e6
+                );
+                ui.label(RichText::new(text).size(11.0).color(TX));
+            }
             if let Some(e) = &status.error {
                 ui.label(RichText::new(e).size(11.0).color(TX));
             }
@@ -895,6 +911,12 @@ impl App {
             if let Err(e) = iio::library_status() {
                 ui.label(RichText::new(format!("libiio: {e}")).size(11.0).color(TX));
             }
+            ui.add_space(4.0);
+            ui.label(self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)"));
+            let low = self.t("1.2 MS/s · Ethernet (FIR filter in the radio)", "1.2 MS/s · Ethernet (cihazda FIR filtresi)");
+            ui.radio_value(&mut self.edit_rate, 1.2e6, low);
+            let high = self.t("2.4 MS/s · USB", "2.4 MS/s · USB");
+            ui.radio_value(&mut self.edit_rate, 2.4e6, high);
             ui.add_space(8.0);
             ui::caption(ui, self.t("RECEIVER", "ALICI"), RX);
             ui.horizontal(|ui| {
@@ -949,6 +971,7 @@ impl App {
                 self.edit_uri = iio::normalize_uri(&self.edit_uri);
                 self.config.device = if self.edit_device_iio { DeviceChoice::Iio(self.edit_uri.clone()) } else { DeviceChoice::Simulator };
                 self.config.lnb_lo_hz = self.edit_lnb_mhz * 1e6;
+                self.config = self.config.clone().with_rate(self.edit_rate);
                 self.config.rx_gain = (!self.edit_auto_gain).then_some(self.edit_gain);
                 self.config.microphone = self.edit_mic.clone();
                 self.config.speaker = self.edit_speaker.clone();
