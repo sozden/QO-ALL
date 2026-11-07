@@ -119,6 +119,14 @@ fn text(p: *const c_char) -> Option<String> {
     (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
+/// A libiio URI from what the operator typed: a bare address or host name
+/// ("192.168.2.1", "pluto.local") gets the network prefix "ip:".
+pub fn normalize_uri(text: &str) -> String {
+    let t = text.trim();
+    let known = ["ip:", "usb:", "local:", "serial:", "xml:"];
+    if t.is_empty() || known.iter().any(|p| t.to_ascii_lowercase().starts_with(p)) { t.to_string() } else { format!("ip:{t}") }
+}
+
 /// libiio contexts found on USB: (URI, description).
 pub fn scan_usb() -> Vec<(String, String)> {
     let Ok(api) = Api::load() else { return Vec::new() };
@@ -235,8 +243,9 @@ pub struct IioRadio {
 unsafe impl Send for IioRadio {}
 
 impl IioRadio {
-    /// `uri` e.g. "ip:192.168.2.1" or "usb:1.5.5".
+    /// `uri` e.g. "ip:192.168.2.1" or "usb:1.5.5" (a bare address is taken as "ip:").
     pub fn open(uri: &str) -> Result<Self, String> {
+        let uri = &normalize_uri(uri);
         let api = Api::load()?;
         let context = unsafe { (api.create_context)(cstr(uri).as_ptr()) };
         if context.is_null() {
@@ -510,6 +519,15 @@ mod tests {
         assert_eq!(parse_range("[70000000 1 6000000000]"), Some((70e6, 6e9)));
         assert_eq!(parse_range("[2083333 1 61440000]"), Some((2_083_333.0, 61.44e6)));
         assert_eq!(parse_range("garbage"), None);
+    }
+
+    #[test]
+    fn bare_addresses_become_network_uris() {
+        assert_eq!(normalize_uri(" 192.168.3.50 "), "ip:192.168.3.50");
+        assert_eq!(normalize_uri("pluto.local"), "ip:pluto.local");
+        assert_eq!(normalize_uri("ip:192.168.2.1"), "ip:192.168.2.1");
+        assert_eq!(normalize_uri("usb:1.5.5"), "usb:1.5.5");
+        assert_eq!(normalize_uri("IP:10.0.0.2"), "IP:10.0.0.2");
     }
 
     #[test]

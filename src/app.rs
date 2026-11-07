@@ -118,7 +118,7 @@ impl App {
             }
         };
         let device = match s.text("device") {
-            Some(uri) if uri != "simulator" => DeviceChoice::Iio(uri),
+            Some(uri) if uri != "simulator" => DeviceChoice::Iio(iio::normalize_uri(&uri)),
             _ => DeviceChoice::Simulator,
         };
         let defaults = StationConfig::default();
@@ -209,7 +209,13 @@ impl App {
         self.armed = false;
         self.ptt_latched = false;
         self.tune = false;
+        // Nothing of the previous radio stays on screen (a failed connection must not
+        // look like a working one).
+        self.line.clear();
         self.waterfall.pixels.fill(DEEP);
+        if let Some(tex) = &mut self.waterfall_tex {
+            tex.set(self.waterfall.clone(), TextureOptions::LINEAR);
+        }
         let listen = ListenSettings { dial_hz: 0.0, mode: self.mode, bandwidth_hz: self.mode.default_bandwidth(), audio_rate: 48e3, volume: self.volume };
         let ctx = ctx.clone();
         let engine = Engine::start(self.config.clone(), listen, TxSettings::default(), self.volume, move || ctx.request_repaint());
@@ -901,7 +907,8 @@ impl App {
                 });
             ui.add_space(12.0);
             if ui.add(egui::Button::new(RichText::new(self.t("Apply and restart", "Uygula ve yeniden başlat")).color(BG)).fill(RX)).clicked() {
-                self.config.device = if self.edit_device_iio { DeviceChoice::Iio(self.edit_uri.trim().to_string()) } else { DeviceChoice::Simulator };
+                self.edit_uri = iio::normalize_uri(&self.edit_uri);
+                self.config.device = if self.edit_device_iio { DeviceChoice::Iio(self.edit_uri.clone()) } else { DeviceChoice::Simulator };
                 self.config.lnb_lo_hz = self.edit_lnb_mhz * 1e6;
                 self.config.rx_gain = (!self.edit_auto_gain).then_some(self.edit_gain);
                 self.config.microphone = self.edit_mic.clone();
