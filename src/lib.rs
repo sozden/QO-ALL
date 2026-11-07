@@ -3,6 +3,7 @@
 //! on its own.
 
 pub mod audio;
+pub mod bandplan;
 pub mod beacon;
 pub mod cw;
 pub mod demod;
@@ -13,3 +14,5 @@ pub mod iio;
 pub mod logo;
 pub mod paths;
 pub mod source;
+pub mod tx;
+pub mod vox;
