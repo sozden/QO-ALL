@@ -1,6 +1,6 @@
 [package]
 name = "qo-all"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Full-duplex SSB transceiver for the QO-100 narrow-band transponder"

@@ -34,12 +34,25 @@ pub const FIR_RATE_LIMIT: f64 = 2_083_334.0;
 /// Taps of the low-rate FIR filters.
 const FIR_TAPS: usize = 128;
 
+/// Clock chain for `rate` with the FIR filters by four and the three half-band stages by
+/// two: (BBPLL, ADC/DAC, HB3 out, HB2 out, FIR in, sample rate), as the filter file's
+/// RTX/RRX lines give it. The BBPLL must run at 715..1430 MHz, a power of two above
+/// the converter clock.
+pub fn clock_chain(rate: f64) -> Option<[u64; 6]> {
+    let r = rate.round() as u64;
+    let adc = r * 32;
+    let pll = (1..=6).map(|k| adc << k).find(|p| (715_000_000..=1_430_000_000).contains(p))?;
+    Some([pll, adc, r * 16, r * 8, r * 4, r])
+}
+
 /// Filter configuration for rates below `FIR_RATE_LIMIT`, in the AD936x filter file
 /// format: decimation and interpolation by four, a low-pass passing ±0.45 of the output
-/// rate. Each line holds the transmit, then the receive coefficient. The receive filter
+/// rate, and the clock chain for `rate` (without it the chip would first have to enable
+/// the filter at the old, higher rate, where its 128 taps do not fit, and refuses). Each
+/// coefficient line holds the transmit, then the receive coefficient. The receive filter
 /// has a gain of 2 with the chip's -6 dB; the transmit filter a gain of 4 (×0.9), making
 /// up for the three zeros the interpolation puts between samples.
-pub fn low_rate_fir() -> String {
+pub fn low_rate_fir(rate: f64) -> String {
     let n = FIR_TAPS;
     // Cut-off in cycles per sample at four times the output rate: 0.55 of the output
     // rate's Nyquist band edge (0.5 / 4 × 1.1).
@@ -57,6 +70,12 @@ pub fn low_rate_fir() -> String {
     let scale = |gain: f64| -> Vec<i32> { h.iter().map(|v| (v / sum * gain * 32_768.0).round() as i32).collect() };
     let (tx, rx) = (scale(4.0 * 0.9), scale(2.0 * 0.95));
     let mut out = String::from("RX 3 GAIN -6 DEC 4\nTX 3 GAIN 0 INT 4\n");
+    if let Some(chain) = clock_chain(rate) {
+        let line = chain.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+        out += &format!("RTX {line}\nRRX {line}\n");
+        let bw = (rate * 0.9).round() as u64;
+        out += &format!("BWTX {bw}\nBWRX {bw}\n");
+    }
     for (t, r) in tx.iter().zip(&rx) {
         out += &format!("{t},{r}\n");
     }
@@ -368,18 +387,34 @@ impl IioRadio {
         let (phy, rx_config) = (self.phy, self.rx_config);
         let set_rate = || s.write(rx_config, "sampling_frequency", &format!("{}", rate.round() as i64));
         if rate < FIR_RATE_LIMIT {
-            // Our own decimating/interpolating filters, then the rate they allow.
-            s.write_device(phy, "filter_fir_config", &low_rate_fir()).map_err(|e| format!("FIR filter not accepted: {e}"))?;
-            s.write_device(phy, "in_out_voltage_filter_fir_en", "1")
-                .and_then(|_| set_rate())
-                .or_else(|_| set_rate().and_then(|_| s.write_device(phy, "in_out_voltage_filter_fir_en", "1")))
-                .map_err(|e| format!("{:.2} MS/s with the FIR filter: {e}", rate / 1e6))?;
+            // Our own decimating/interpolating filters with their clock chain: loading
+            // them moves the chip to the new rate.
+            s.write_device(phy, "filter_fir_config", &low_rate_fir(rate)).map_err(|e| format!("FIR filter not accepted: {e}"))?;
+            let enabled = s.write_device(phy, "in_out_voltage_filter_fir_en", "1");
+            let current = || s.read(rx_config, "sampling_frequency").and_then(|v| v.parse::<f64>().ok());
+            if current().is_none_or(|c| (c - rate).abs() > rate * 0.01) {
+                set_rate().map_err(|e| {
+                    format!(
+                        "{:.2} MS/s with the FIR filter: {e} (enable: {enabled:?}; now {:?} S/s; {})",
+                        rate / 1e6,
+                        current(),
+                        s.read_device(phy, "rx_path_rates").unwrap_or_default()
+                    )
+                })?;
+            }
             self.fir_warning = None;
         } else {
             // A FIR filter left loaded by another program (SDR-Console, for its own rate)
             // cut off part of the band. The Pluto refuses to switch off the transmit
             // filter alone, so both go off together; failing that, each on its own.
-            self.fir_warning = s.write_device(phy, "in_out_voltage_filter_fir_en", "0").err().and_then(|both| {
+            // At a rate that needs the filter (ours, from a low-rate run) it cannot be
+            // switched off either: our filter with the new rate's clock chain moves the
+            // chip there first.
+            let off = || s.write_device(phy, "in_out_voltage_filter_fir_en", "0");
+            let first = off().or_else(|e| {
+                s.write_device(phy, "filter_fir_config", &low_rate_fir(rate)).and_then(|_| off()).map_err(|_| e)
+            });
+            self.fir_warning = first.err().and_then(|both| {
                 let tx_config = s.channel(phy, "voltage0", true);
                 let rx = s.write(rx_config, "filter_fir_en", "0");
                 let tx = if tx_config.is_null() { Ok(()) } else { s.write(tx_config, "filter_fir_en", "0") };
@@ -630,11 +665,14 @@ mod tests {
 
     #[test]
     fn low_rate_fir_file() {
-        let text = low_rate_fir();
+        let text = low_rate_fir(1.2e6);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "RX 3 GAIN -6 DEC 4");
         assert_eq!(lines[1], "TX 3 GAIN 0 INT 4");
-        let taps: Vec<(i32, i32)> = lines[2..]
+        assert_eq!(lines[2], "RTX 1228800000 38400000 19200000 9600000 4800000 1200000");
+        assert_eq!(lines[3], "RRX 1228800000 38400000 19200000 9600000 4800000 1200000");
+        assert_eq!(lines[4], "BWTX 1080000");
+        let taps: Vec<(i32, i32)> = lines[6..]
             .iter()
             .map(|l| {
                 let (t, r) = l.split_once(',').unwrap();
@@ -647,6 +685,14 @@ mod tests {
         assert!((tx - 117_965).abs() < 100 && (rx - 62_259).abs() < 100, "{tx} {rx}");
         // Symmetric (linear phase).
         assert!((0..64).all(|i| taps[i] == taps[127 - i]));
+    }
+
+    #[test]
+    fn clock_chains() {
+        // ADI's LTE 1.4 MHz filter file: RTX 983040000 61440000 30720000 15360000 7680000 1920000
+        // (HB3 by two there too); ours keeps the same steps.
+        assert_eq!(clock_chain(1.92e6), Some([1_966_080_000 / 2, 61_440_000, 30_720_000, 15_360_000, 7_680_000, 1_920_000]));
+        assert_eq!(clock_chain(600e3).map(|c| c[0]), Some(1_228_800_000));
     }
 
     #[test]
