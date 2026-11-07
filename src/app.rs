@@ -26,6 +26,8 @@ const ZOOMS: [Option<f64>; 3] = [None, Some(60e3), Some(12e3)];
 const WATERFALL_ROWS: usize = 300;
 /// FT8 and FT4 dial on QO-100 (downlink, Hz).
 const FT_DIAL_HZ: f64 = 10_489.540e6;
+/// Modes offered: SSB on QO-100 is USB only.
+const MODES: [Mode; 2] = [Mode::Usb, Mode::Cw];
 /// Largest transmit attenuation offered on the slider (dB).
 const MAX_ATTENUATION: f64 = 60.0;
 
@@ -65,6 +67,12 @@ pub struct App {
     auto_lock: bool,
     /// Added to the uplink frequency to make up for the radio's own error (Hz).
     tx_correction: f64,
+    /// Receive and transmit offsets from the dials (Hz), for small differences between
+    /// the two: each applies only while switched on.
+    rit_on: bool,
+    rit: f64,
+    xit_on: bool,
+    xit: f64,
 
     armed: bool,
     ptt_latched: bool,
@@ -133,7 +141,8 @@ impl App {
         };
         let logo = qo_all::logo::rgba(96, false);
         let logo = cc.egui_ctx.load_texture("logo", ColorImage::from_rgba_unmultiplied([96, 96], &logo), TextureOptions::LINEAR);
-        let mode = s.text("mode").and_then(|m| Mode::from_name(&m)).unwrap_or(Mode::Usb);
+        // LSB is not used on QO-100: a saved LSB becomes USB.
+        let mode = s.text("mode").and_then(|m| Mode::from_name(&m)).filter(|m| MODES.contains(m)).unwrap_or(Mode::Usb);
         let tx_defaults = TxSettings::default();
         let vox = VoxSettings {
             enabled: s.get("vox").unwrap_or(false),
@@ -152,6 +161,10 @@ impl App {
             mode,
             auto_lock: s.get("auto_lock").unwrap_or(true),
             tx_correction: s.get("tx_correction_hz").unwrap_or(0.0),
+            rit_on: s.get("rit_on").unwrap_or(false),
+            rit: s.get("rit_hz").unwrap_or(0.0),
+            xit_on: s.get("xit_on").unwrap_or(false),
+            xit: s.get("xit_hz").unwrap_or(0.0),
             armed: false,
             ptt_latched: false,
             tune: false,
@@ -234,18 +247,24 @@ impl App {
         if self.linked { self.rx_dial } else { self.tx_dial }
     }
 
+    /// Where the receiver listens: the dial plus the RIT.
+    fn rx_listen(&self) -> f64 {
+        self.rx_dial + if self.rit_on { self.rit } else { 0.0 }
+    }
+
+    /// Where the transmitted signal comes down: the transmit dial plus the XIT.
+    fn tx_signal(&self) -> f64 {
+        self.tx_downlink() + if self.xit_on { self.xit } else { 0.0 }
+    }
+
     fn uplink(&self) -> f64 {
-        bandplan::uplink(self.tx_downlink()) + self.tx_correction
+        bandplan::uplink(self.tx_signal()) + self.tx_correction
     }
 
     /// Band plan check of the transmitted signal.
     fn tx_band(&self) -> Result<(), Refusal> {
-        let d = self.tx_downlink();
-        let (lo, hi) = match self.mode {
-            Mode::Lsb => (d - qo_all::tx::AUDIO_HIGH, d - qo_all::tx::AUDIO_LOW),
-            _ => (d + qo_all::tx::AUDIO_LOW, d + qo_all::tx::AUDIO_HIGH),
-        };
-        bandplan::check(lo, hi)
+        let d = self.tx_signal();
+        bandplan::check(d + qo_all::tx::AUDIO_LOW, d + qo_all::tx::AUDIO_HIGH)
     }
 
     fn view_band(&self) -> (f64, f64) {
@@ -261,7 +280,7 @@ impl App {
         let c = self.correction_now();
         let to_if = |rf: f64| rf - self.config.lnb_lo_hz - c;
         e.listener.update(|l| {
-            l.dial_hz = to_if(self.rx_dial);
+            l.dial_hz = to_if(self.rx_listen());
             l.mode = self.mode;
             l.bandwidth_hz = self.mode.default_bandwidth();
             l.volume = self.volume;
@@ -269,7 +288,7 @@ impl App {
         e.volume.set(self.volume);
         {
             let mut tx = e.tx.lock().unwrap();
-            tx.mode = if self.mode == Mode::Lsb { Mode::Lsb } else { Mode::Usb };
+            tx.mode = Mode::Usb;
             tx.uplink_hz = self.uplink();
             tx.attenuation_db = self.attenuation;
             tx.mic_gain_db = self.mic_gain_db;
@@ -370,6 +389,10 @@ impl App {
         s.set("mode", self.mode.name());
         s.set("auto_lock", self.auto_lock);
         s.set("tx_correction_hz", self.tx_correction);
+        s.set("rit_on", self.rit_on);
+        s.set("rit_hz", self.rit);
+        s.set("xit_on", self.xit_on);
+        s.set("xit_hz", self.xit);
         s.set("tx_attenuation_db", self.attenuation);
         s.set("mic_gain_db", self.mic_gain_db);
         s.set("compress", self.compress);
@@ -497,9 +520,8 @@ impl App {
                 .allocate_ui(vec2(width, 80.0), |ui| {
                     ui::card(ui, fill, |ui| {
                         ui.set_width(ui.available_width());
-                        let mode = if self.mode == Mode::Lsb { "LSB" } else { "USB" };
                         let shift = if self.linked { String::new() } else { format!(" · shift {:+.2} kHz", shift / 1e3) };
-                        ui::caption(ui, format!("UPLINK · TX · {mode}{shift}"), TX);
+                        ui::caption(ui, format!("UPLINK · TX · USB{shift}"), TX);
                         ui::vfo(ui, uplink, 34.0, TX)
                     })
                 })
@@ -513,7 +535,7 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            for m in Mode::ALL {
+            for m in MODES {
                 if ui::choice(ui, m.name(), self.mode == m, RX) {
                     self.mode = m;
                 }
@@ -523,6 +545,9 @@ impl App {
             if ui::choice(ui, lock, self.auto_lock, BLUE) {
                 self.auto_lock = !self.auto_lock;
             }
+            ui.add_space(12.0);
+            offset_control(ui, "RIT", &mut self.rit_on, &mut self.rit, RX);
+            offset_control(ui, "XIT", &mut self.xit_on, &mut self.xit, TX);
             ui.add_space(12.0);
             for (i, label) in ["520 kHz", "60 kHz", "12 kHz"].iter().enumerate() {
                 if ui::choice(ui, label, self.zoom == i, BLUE) {
@@ -613,14 +638,15 @@ impl App {
         }
         // Receiver passband and dial.
         let (pa, pb) = self.mode.passband(self.mode.default_bandwidth());
-        let rx_band = Rect::from_min_max(pos2(x_of(self.rx_dial + pa), rect.top()), pos2(x_of(self.rx_dial + pb), rect.bottom()));
+        let listen = self.rx_listen();
+        let rx_band = Rect::from_min_max(pos2(x_of(listen + pa), rect.top()), pos2(x_of(listen + pb), rect.bottom()));
         let rx_band = if rx_band.width() < 3.0 { rx_band.expand2(vec2((3.0 - rx_band.width()) / 2.0, 0.0)) } else { rx_band };
         painter.rect_filled(rx_band, CornerRadius::ZERO, RX.gamma_multiply(0.2));
-        let rx_x = x_of(self.rx_dial);
+        let rx_x = x_of(listen);
         painter.line_segment([pos2(rx_x, rect.top()), pos2(rx_x, rect.bottom())], Stroke::new(1.5, RX));
         painter.text(pos2(rx_x + 5.0, rect.top() + 3.0), Align2::LEFT_TOP, "RX", FontId::proportional(12.0), RX);
         // Transmitter dial.
-        let tx_x = x_of(self.tx_downlink());
+        let tx_x = x_of(self.tx_signal());
         ui::dashed_vline(&painter, tx_x, rect.top(), rect.bottom(), Stroke::new(1.5, TX));
         painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
 
@@ -934,6 +960,26 @@ impl App {
             ui.label(RichText::new(format!("QO-ALL {} · GPL-3.0-or-later", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM));
         });
     }
+}
+
+/// RIT or XIT: a switch and its offset. Dragging or the mouse wheel changes the offset
+/// by 10 Hz steps (Shift: 100 Hz); a double click sets it back to zero.
+fn offset_control(ui: &mut egui::Ui, name: &str, on: &mut bool, hz: &mut f64, color: Color32) {
+    if ui::choice(ui, name, *on, color) {
+        *on = !*on;
+    }
+    let response = ui.add_enabled(
+        *on,
+        egui::DragValue::new(hz).speed(10.0).range(-5_000.0..=5_000.0).suffix(" Hz").custom_formatter(|v, _| format!("{v:+.0}")),
+    );
+    if *on && response.hovered() {
+        let (steps, shift) = ui::wheel_steps(ui);
+        *hz = (*hz + steps as f64 * if shift { 100.0 } else { 10.0 }).clamp(-5_000.0, 5_000.0);
+    }
+    if response.double_clicked() {
+        *hz = 0.0;
+    }
+    *hz = (*hz / 10.0).round() * 10.0;
 }
 
 fn clock(secs: u64) -> String {

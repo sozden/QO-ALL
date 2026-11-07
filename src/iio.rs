@@ -19,9 +19,10 @@ use num_complex::Complex;
 fn buffer_samples(rate: f64) -> usize {
     ((rate * 0.04) as usize).next_power_of_two().clamp(65_536, 1 << 20)
 }
-/// Samples per transmit transfer: about 20 ms (short, so PTT reacts quickly).
+/// Samples per transmit transfer: about 10 ms. The device queues four of them, so short
+/// transfers keep the delay of the voice low.
 fn tx_buffer_samples(rate: f64) -> usize {
-    ((rate * 0.02) as usize).next_power_of_two().clamp(16_384, 1 << 18)
+    ((rate * 0.01) as usize).next_power_of_two().clamp(16_384, 1 << 18)
 }
 /// The AD9361 ADC is 12-bit; samples arrive in the ±2048 range.
 const FULL_SCALE: f32 = 2048.0;
@@ -591,7 +592,7 @@ mod tests {
 
     #[test]
     fn buffer_sizes() {
-        assert_eq!(tx_buffer_samples(2.4e6), 65_536);
+        assert_eq!(tx_buffer_samples(2.4e6), 32_768);
         assert_eq!(buffer_samples(2.4e6), 131_072);
     }
 

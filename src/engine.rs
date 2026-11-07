@@ -33,6 +33,9 @@ const TUNE_HZ: f64 = 1_000.0;
 const TUNE_LEVEL: f32 = 1.0;
 /// Tune tone made per round (s); the radio's write paces the loop.
 const TUNE_CHUNK_S: f64 = 0.02;
+/// Silence sent ahead of a transmission (s): the radio's queue then holds this much in
+/// reserve, so network jitter does not break up the voice.
+const TX_LEAD_S: f64 = 0.06;
 /// Room kept at the band edges for the transmit signal (Hz).
 const TX_EDGE_HZ: f64 = 50e3;
 
@@ -448,7 +451,9 @@ fn transmit(link: TxLink) {
         let s = *link.settings.lock().unwrap();
         vox.settings = s.vox;
         control.time_out = s.time_out;
-        delay.set_length((s.vox.preroll_ms as f64 / 1e3 * link.mic_rate) as usize);
+        // The pre-roll only serves VOX; with PTT it would just delay the voice.
+        let preroll = if s.vox.enabled { s.vox.preroll_ms } else { 0 };
+        delay.set_length((preroll as f64 / 1e3 * link.mic_rate) as usize);
         if let Some(chunk) = &chunk {
             vox.process(chunk, link.listener.speaker_db());
             delayed.clear();
@@ -485,7 +490,7 @@ fn transmit(link: TxLink) {
                 result = d.set_attenuation(attenuation);
             }
             if !on && result.is_ok() {
-                result = d.set_powered(true);
+                result = d.set_powered(true).and_then(|_| d.write(&vec![Complex::default(); (link.rate * TX_LEAD_S) as usize]));
                 on = true;
                 error = None;
             }
