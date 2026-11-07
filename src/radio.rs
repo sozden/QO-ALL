@@ -15,6 +15,10 @@ pub trait RxDevice: Send {
     fn model(&self) -> String;
     /// The transmitting half, if the radio has one.
     fn transmitter(&self) -> Result<Box<dyn TxDevice>, String>;
+    /// Something the operator should know about the radio's set-up.
+    fn warning(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The transmitting half.
@@ -49,6 +53,9 @@ impl RxDevice for IioRadio {
     }
     fn transmitter(&self) -> Result<Box<dyn TxDevice>, String> {
         Ok(Box::new(IioRadio::transmitter(self)?))
+    }
+    fn warning(&self) -> Option<String> {
+        self.fir_warning.clone()
     }
 }
 

@@ -50,6 +50,7 @@ pub struct App {
     /// What the radio said when it opened, or why it did not.
     model: Option<String>,
     tx_capable: Option<Result<(), String>>,
+    warning: Option<String>,
     error: Option<String>,
     rate: f64,
     /// Last known converter correction (Hz), kept for the next start.
@@ -188,6 +189,7 @@ impl App {
             engine: None,
             model: None,
             tx_capable: None,
+            warning: None,
             error: None,
             rate: 0.0,
             settings: s,
@@ -204,6 +206,7 @@ impl App {
         self.engine = None;
         self.model = None;
         self.tx_capable = None;
+        self.warning = None;
         self.error = None;
         self.rate = 0.0;
         self.armed = false;
@@ -299,9 +302,10 @@ impl App {
         }
         for ev in events {
             match ev {
-                Event::Opened { model, tx } => {
+                Event::Opened { model, tx, warning } => {
                     self.model = Some(model);
                     self.tx_capable = Some(tx);
+                    self.warning = warning;
                 }
                 Event::Frame(f) => self.push_frame(f),
                 Event::Rate(r) => self.rate = r,
@@ -428,6 +432,9 @@ impl App {
                 _ => (self.t("Looking for the beacon…", "Beacon aranıyor…").to_string(), MUTED, RAISED),
             };
             ui::pill(ui, text, fg, bg);
+            if let Some(w) = &self.warning {
+                ui::pill(ui, w.clone(), RX, RAISED);
+            }
             if self.rate > 0.0 && self.rate < self.config.sample_rate * 0.95 {
                 ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), TX, RAISED)
                     .on_hover_text(self.t("The radio delivers fewer samples than set", "Cihaz ayarlanandan az örnek gönderiyor"));
@@ -790,7 +797,13 @@ impl App {
             }
             let state = match status.state {
                 TxState::Transmit => match status.remaining {
-                    Some(r) => format!("TX · {}:{:02} · ALC {:.0} dB", r.as_secs() / 60, r.as_secs() % 60, status.alc_db),
+                    Some(r) => format!(
+                        "TX · {}:{:02} · ALC {:.0} dB\n{:.2} MS/s",
+                        r.as_secs() / 60,
+                        r.as_secs() % 60,
+                        status.alc_db,
+                        status.sent_rate / 1e6
+                    ),
                     None => "TX".into(),
                 },
                 TxState::Receive => "RX".into(),

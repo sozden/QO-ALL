@@ -44,6 +44,8 @@ struct Api {
     find_channel: unsafe extern "C" fn(Ptr, *const c_char, bool) -> Ptr,
     attr_write: unsafe extern "C" fn(Ptr, *const c_char, *const c_char) -> isize,
     attr_read: unsafe extern "C" fn(Ptr, *const c_char, *mut c_char, usize) -> isize,
+    device_attr_write: unsafe extern "C" fn(Ptr, *const c_char, *const c_char) -> isize,
+    device_attr_read: unsafe extern "C" fn(Ptr, *const c_char, *mut c_char, usize) -> isize,
     channel_enable: unsafe extern "C" fn(Ptr),
     create_buffer: unsafe extern "C" fn(Ptr, usize, bool) -> Ptr,
     buffer_refill: unsafe extern "C" fn(Ptr) -> isize,
@@ -87,6 +89,8 @@ impl Api {
                 find_channel: sym!("iio_device_find_channel"),
                 attr_write: sym!("iio_channel_attr_write"),
                 attr_read: sym!("iio_channel_attr_read"),
+                device_attr_write: sym!("iio_device_attr_write"),
+                device_attr_read: sym!("iio_device_attr_read"),
                 channel_enable: sym!("iio_channel_enable"),
                 create_buffer: sym!("iio_device_create_buffer"),
                 buffer_refill: sym!("iio_buffer_refill"),
@@ -205,6 +209,23 @@ impl Shared {
         Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
     }
 
+    fn write_device(&self, device: Ptr, attr: &str, value: &str) -> Result<(), String> {
+        let _guard = self.attrs.lock().unwrap();
+        let n = unsafe { (self.api.device_attr_write)(device, cstr(attr).as_ptr(), cstr(value).as_ptr()) };
+        if n < 0 { Err(format!("{attr}={value}: error {n}")) } else { Ok(()) }
+    }
+
+    fn read_device(&self, device: Ptr, attr: &str) -> Option<String> {
+        let _guard = self.attrs.lock().unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = unsafe { (self.api.device_attr_read)(device, cstr(attr).as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        if n <= 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(n as usize);
+        Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
+    }
+
     fn device(&self, name: &str) -> Ptr {
         unsafe { (self.api.find_device)(self.context, cstr(name).as_ptr()) }
     }
@@ -224,6 +245,9 @@ impl Drop for Shared {
 pub struct IioRadio {
     shared: Arc<Shared>,
     uri: String,
+    phy: Ptr,
+    /// Why the programmable FIR filters could not be switched off, if so.
+    pub fir_warning: Option<String>,
     /// The receive settings channel of ad9361-phy (sample rate, bandwidth, gain).
     rx_config: Ptr,
     /// The RX_LO channel of ad9361-phy.
@@ -263,9 +287,21 @@ impl IioRadio {
         if [rx_config, rx_lo, i, q].iter().any(|c| c.is_null()) {
             return Err(format!("{uri}: receiver channels not found"));
         }
+        // A FIR filter left loaded by another program (SDR-Console, for its own rate)
+        // tilted QODA's transmitted signal by 5 dB; without it the AD936x still reaches
+        // 2.083 MS/s and more. The Pluto refuses to switch off the transmit filter alone,
+        // so both go off together; failing that, each on its own.
+        let fir_warning = shared.write_device(phy, "in_out_voltage_filter_fir_en", "0").err().and_then(|both| {
+            let tx_config = shared.channel(phy, "voltage0", true);
+            let rx = shared.write(rx_config, "filter_fir_en", "0");
+            let tx = if tx_config.is_null() { Ok(()) } else { shared.write(tx_config, "filter_fir_en", "0") };
+            (rx.is_err() || tx.is_err()).then(|| format!("FIR filter left on ({both})"))
+        });
         Ok(Self {
             shared,
             uri: uri.to_string(),
+            phy,
+            fir_warning,
             rx_config,
             rx_lo,
             rx,
@@ -356,6 +392,29 @@ impl IioRadio {
         out[..n].copy_from_slice(&self.pending[self.position..self.position + n]);
         self.position += n;
         Ok(n)
+    }
+
+    /// The transmit path as the device reports it, one "name: value" per line, for
+    /// diagnosis: rates through the interpolation chain, FIR, bandwidth, attenuation, LO.
+    pub fn describe_tx(&self) -> String {
+        let s = &self.shared;
+        let mut out = String::new();
+        for attr in ["tx_path_rates", "rx_path_rates", "in_out_voltage_filter_fir_en", "ensm_mode"] {
+            out += &format!("{attr}: {}\n", s.read_device(self.phy, attr).unwrap_or_else(|| "?".into()));
+        }
+        let tx_config = s.channel(self.phy, "voltage0", true);
+        let tx_lo = s.channel(self.phy, "altvoltage1", true);
+        if !tx_config.is_null() {
+            for attr in ["sampling_frequency", "rf_bandwidth", "filter_fir_en", "hardwaregain", "rf_port_select"] {
+                out += &format!("tx {attr}: {}\n", s.read(tx_config, attr).unwrap_or_else(|| "?".into()));
+            }
+        }
+        if !tx_lo.is_null() {
+            for attr in ["frequency", "powerdown"] {
+                out += &format!("tx_lo {attr}: {}\n", s.read(tx_lo, attr).unwrap_or_else(|| "?".into()));
+            }
+        }
+        out
     }
 
     /// The transmitting half, on the same connection. It starts with its LO powered down

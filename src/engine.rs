@@ -29,7 +29,8 @@ use crate::vox::{DelayLine, TxControl, TxState, Vox, VoxSettings};
 const QUEUE_BLOCKS: usize = 16;
 /// Frequency and level of the tune tone.
 const TUNE_HZ: f64 = 1_000.0;
-const TUNE_LEVEL: f32 = 0.5;
+/// A full-scale tone: the modulator's limiter brings it to its peak level.
+const TUNE_LEVEL: f32 = 1.0;
 /// Tune tone made per round (s); the radio's write paces the loop.
 const TUNE_CHUNK_S: f64 = 0.02;
 /// Room kept at the band edges for the transmit signal (Hz).
@@ -90,7 +91,7 @@ pub enum Command {
 
 pub enum Event {
     /// The radio is open; `tx` tells whether it can transmit.
-    Opened { model: String, tx: Result<(), String> },
+    Opened { model: String, tx: Result<(), String>, warning: Option<String> },
     Frame(Frame),
     /// Samples per second arriving from the radio.
     Rate(f64),
@@ -148,12 +149,14 @@ pub struct TxStatus {
     pub alc_db: f32,
     /// Time left before the time-out timer stops the transmission.
     pub remaining: Option<Duration>,
+    /// Samples per second handed to the radio while transmitting (should be its rate).
+    pub sent_rate: f64,
     pub error: Option<String>,
 }
 
 impl Default for TxStatus {
     fn default() -> Self {
-        Self { state: TxState::Receive, mic_db: -150.0, vox_keyed: false, alc_db: 0.0, remaining: None, error: None }
+        Self { state: TxState::Receive, mic_db: -150.0, vox_keyed: false, alc_db: 0.0, remaining: None, sent_rate: 0.0, error: None }
     }
 }
 
@@ -336,7 +339,7 @@ fn receive(
 ) -> Result<(), String> {
     let mut radio = open(config)?;
     let tx = radio.transmitter();
-    let _ = events.send(Event::Opened { model: radio.model(), tx: tx.as_ref().map(|_| ()).map_err(|e| e.clone()) });
+    let _ = events.send(Event::Opened { model: radio.model(), tx: tx.as_ref().map(|_| ()).map_err(|e| e.clone()), warning: radio.warning() });
     notify();
     if let Ok(t) = tx {
         let _ = handoff.send(t);
@@ -408,6 +411,9 @@ fn transmit(link: TxLink) {
     let mut last_state = TxState::Receive;
     let mut error: Option<String> = None;
     let mut tune_phase = 0.0f64;
+    // Samples sent in the current second, and the rate of the last one.
+    let mut sent = (Instant::now(), 0usize);
+    let mut sent_rate = 0.0;
     let fail = |device: &mut Option<Box<dyn TxDevice>>, error: &mut Option<String>, e: String| {
         *error = Some(e);
         *device = None;
@@ -424,14 +430,18 @@ fn transmit(link: TxLink) {
                 Err(e) => error = Some(e),
             }
         }
+        // While the tune tone goes out, the radio's write paces the loop: no waiting for
+        // the microphone, or the radio would be fed slower than real time.
+        let tuning = on && link.settings.lock().unwrap().tune;
+        let wait = if tuning { Duration::ZERO } else { Duration::from_millis(20) };
         let chunk = match &link.mic {
-            Some(rx) => match rx.recv_timeout(Duration::from_millis(20)) {
+            Some(rx) => match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
             },
             None => {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(wait);
                 None
             }
         };
@@ -484,6 +494,12 @@ fn transmit(link: TxLink) {
                 iq.clear();
                 m.process(&audio, 1.0, &mut iq);
                 result = d.write(&iq);
+                sent.1 += iq.len();
+            }
+            let elapsed = sent.0.elapsed().as_secs_f64();
+            if elapsed >= 1.0 {
+                sent_rate = sent.1 as f64 / elapsed;
+                sent = (Instant::now(), 0);
             }
             if let Err(e) = result {
                 fail(&mut device, &mut error, e);
@@ -500,6 +516,8 @@ fn transmit(link: TxLink) {
                 }
                 on = false;
                 attenuation = f64::NAN;
+                sent = (Instant::now(), 0);
+                sent_rate = 0.0;
                 delay.clear();
                 modulator = None;
             }
@@ -513,6 +531,7 @@ fn transmit(link: TxLink) {
             vox_keyed: vox.keyed(),
             alc_db: if on { modulator.as_ref().map_or(0.0, |m| m.alc_db) } else { 0.0 },
             remaining: control.remaining(Instant::now()),
+            sent_rate,
             error: error.clone(),
         };
         drop(st);
@@ -566,7 +585,7 @@ mod tests {
         let mut frames = 0;
         while started.elapsed() < Duration::from_secs(8) {
             match engine.events.recv_timeout(Duration::from_secs(2)) {
-                Ok(Event::Opened { model, tx }) => println!("opened {model}, tx {tx:?}"),
+                Ok(Event::Opened { model, tx, .. }) => println!("opened {model}, tx {tx:?}"),
                 Ok(Event::Frame(_)) => frames += 1,
                 Ok(Event::Rate(r)) => println!("rate {r:.0}"),
                 Ok(Event::Error(e)) => panic!("{e}"),
@@ -597,6 +616,7 @@ mod tests {
             }
         }
         println!("tx status {:?}", engine.tx_status.lock().unwrap());
+        assert!(engine.tx_status.lock().unwrap().sent_rate > 2.3e6, "the radio is fed in real time");
         let f = last.expect("frame");
         let peak = f.db.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         let at = f.lo_hz + (peak.0 as f64 + 0.5) / f.db.len() as f64 * (f.hi_hz - f.lo_hz);

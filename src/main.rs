@@ -48,6 +48,10 @@ fn diagnose() {
         match qo_all::iio::IioRadio::open(&uri) {
             Ok(radio) => {
                 println!("{uri}: {:?}", radio.identity());
+                if let Some(w) = &radio.fir_warning {
+                    println!("warning: {w}");
+                }
+                print!("{}", radio.describe_tx());
                 // Opening the transmitter leaves it powered down and fully attenuated.
                 println!("transmitter: {:?}", radio.transmitter().map(|t| t.buffer_len()));
             }
