@@ -1,0 +1,21 @@
+[package]
+name = "qo-all"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Full-duplex SSB transceiver for the QO-100 narrow-band transponder"
+
+[lib]
+name = "qo_all"
+
+[dependencies]
+cpal = "0.18.2"
+eframe = "0.35.0"
+libloading = "0.9.0"
+num-complex = "0.4"
+rustfft = "6"
+sys-locale = "0.3"
+
+[profile.dev]
+# DSP is far too slow without optimisation.
+opt-level = 2
