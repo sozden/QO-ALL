@@ -94,6 +94,8 @@ pub struct App {
     vox: VoxSettings,
     time_out_s: u32,
     volume: f32,
+    /// Speaker off without losing the volume set.
+    muted: bool,
 
     zoom: usize,
     /// Centre of the zoomed view (downlink, Hz).
@@ -202,7 +204,8 @@ impl App {
             compress: s.get("compress").unwrap_or(false),
             vox,
             time_out_s: s.get("time_out_s").unwrap_or(180),
-            volume: s.get("volume").unwrap_or(0.7),
+            volume: s.get("volume").unwrap_or(0.4),
+            muted: s.get("muted").unwrap_or(false),
             zoom: s.get("zoom").unwrap_or(0).min(ZOOMS.len() - 1),
             zoom_center: rx_dial,
             line: Vec::new(),
@@ -288,6 +291,11 @@ impl App {
         self.sync();
     }
 
+    /// The volume the speaker plays at.
+    fn speaker_volume(&self) -> f32 {
+        if self.muted { 0.0 } else { self.volume }
+    }
+
     fn correction_now(&self) -> f64 {
         self.engine.as_ref().and_then(|e| e.correction()).unwrap_or(self.correction)
     }
@@ -356,9 +364,9 @@ impl App {
             l.dial_hz = to_if(self.rx_listen());
             l.mode = self.mode;
             l.bandwidth_hz = self.mode.default_bandwidth();
-            l.volume = self.volume;
+            l.volume = self.speaker_volume();
         });
-        e.volume.set(self.volume);
+        e.volume.set(self.speaker_volume());
         {
             let mut tx = e.tx.lock().unwrap();
             tx.mode = Mode::Usb;
@@ -495,6 +503,7 @@ impl App {
         s.set_opt("anti_vox_db", self.vox.anti_vox_db);
         s.set("time_out_s", self.time_out_s);
         s.set("volume", self.volume);
+        s.set("muted", self.muted);
         s.set("zoom", self.zoom);
         s.set("ft4", self.ft4_on);
         self.ft.save(s);
@@ -570,6 +579,21 @@ impl App {
                     self.lang = if self.lang == Lang::Tr { Lang::En } else { Lang::Tr };
                     self.save();
                 }
+                ui.add_space(10.0);
+                // Speaker volume and mute, in every mode (right to left here).
+                if ui::choice(ui, self.t("Mute", "Sessiz"), self.muted, TX) {
+                    self.muted = !self.muted;
+                }
+                let mut percent = (self.volume * 100.0).round();
+                ui.spacing_mut().slider_width = 110.0;
+                let r = ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).step_by(1.0).show_value(false));
+                if r.changed() {
+                    self.volume = percent / 100.0;
+                    self.muted = false;
+                }
+                let level = if self.muted { self.t("off", "kapalı").to_string() } else { format!("{percent:.0}%") };
+                ui.label(RichText::new(format!("{} {level}", self.t("Volume", "Ses"))).size(12.0).color(MUTED));
+                ui.add_space(10.0);
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 ui.label(RichText::new(format!("{} UTC", clock(now))).monospace().size(14.0).color(MUTED));
             });
@@ -583,14 +607,22 @@ impl App {
         let transmitting = status.state == TxState::Transmit;
         let level = self.engine.as_ref().map_or(-150.0, |e| e.listener.level_db());
         let width = (ui.available_width() - 60.0) / 2.0;
-        ui.horizontal(|ui| {
+        // Top-aligned, so both displays line up whatever each holds.
+        ui.horizontal_top(|ui| {
             // Receiver.
+            let column = egui::Layout::top_down(egui::Align::Min);
             let rx_change = ui
-                .allocate_ui(vec2(width, 80.0), |ui| {
+                .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
                     ui::card(ui, DEEP, |ui| {
                         ui.set_width(ui.available_width());
                         ui::caption(ui, format!("DOWNLINK · RX · {} · {:.0} dBFS", self.mode.name(), level), RX);
-                        ui::vfo(ui, self.rx_dial, 34.0, RX)
+                        let change = ui::vfo(ui, self.rx_dial, 34.0, RX);
+                        // Under it, as under the transmit side: the band plan's part, and
+                        // the RIT when on.
+                        let rit = if self.rit_on { format!(" · RIT {:+.0} Hz", self.rit) } else { String::new() };
+                        let line = format!("{}{rit}", bandplan::segment(self.rx_listen()).to_uppercase());
+                        ui.label(RichText::new(line).monospace().size(13.0).color(RX.gamma_multiply(0.75)));
+                        change
                     })
                 })
                 .inner;
@@ -610,14 +642,20 @@ impl App {
             // Transmitter.
             let shift = self.tx_downlink() - self.rx_dial;
             let fill = if transmitting { Color32::from_rgb(0x3a, 0x14, 0x18) } else { DEEP };
+            // The big number is where the transmission comes down (10 GHz: in split the
+            // place among the others), the uplink actually sent (2.4 GHz, corrections
+            // included) under it.
             let uplink = self.uplink();
+            let down = self.tx_signal();
             let tx_change = ui
-                .allocate_ui(vec2(width, 80.0), |ui| {
+                .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
                     ui::card(ui, fill, |ui| {
                         ui.set_width(ui.available_width());
                         let shift = if self.linked { String::new() } else { format!(" · shift {:+.2} kHz", shift / 1e3) };
-                        ui::caption(ui, format!("UPLINK · TX · USB{shift}"), TX);
-                        ui::vfo(ui, uplink, 34.0, TX)
+                        ui::caption(ui, format!("TX · USB{shift}"), TX);
+                        let change = ui::vfo(ui, down, 34.0, TX);
+                        ui.label(RichText::new(format!("UPLINK {:.5} MHz", uplink / 1e6)).monospace().size(13.0).color(TX.gamma_multiply(0.75)));
+                        change
                     })
                 })
                 .inner;

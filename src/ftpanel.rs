@@ -317,18 +317,14 @@ impl FtPanel {
     /// Band activity: all decodes, by slot; a double click picks a station.
     pub fn activity(&mut self, ui: &mut egui::Ui, e: &Engine, p: &'static Protocol, tr: bool) {
         let t = |en: &'static str, tr_: &'static str| if tr { tr_ } else { en };
-        ui.horizontal(|ui| {
+        // The legend follows the title, and goes on to the next line when narrow.
+        ui.horizontal_wrapped(|ui| {
             ui::caption(ui, format!("{} · {}", p.name, t("BAND ACTIVITY", "BANT ETKİNLİĞİ")), BLUE);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (bg, label) in [
-                    (TO_ME_BG, t("to me", "bana")),
-                    (NEW_GRID_BG, t("new locator", "yeni lokatör")),
-                    (NEW_CQ_BG, t("new", "yeni")),
-                ] {
-                    ui::pill(ui, label, Color32::WHITE, bg);
-                }
-                ui::pill(ui, t("worked", "çalışılmış"), WORKED, RAISED);
-            });
+            ui.add_space(8.0);
+            ui::pill(ui, t("new", "yeni"), Color32::WHITE, NEW_CQ_BG);
+            ui::pill(ui, t("new locator", "yeni lokatör"), Color32::WHITE, NEW_GRID_BG);
+            ui::pill(ui, t("worked", "çalışılmış"), WORKED, RAISED);
+            ui::pill(ui, t("to me", "bana"), Color32::WHITE, TO_ME_BG);
         });
         let worker = if std::ptr::eq(p, &FT8) { &e.ft8 } else { &e.ft4 };
         let messages = worker.messages();
@@ -349,7 +345,8 @@ impl FtPanel {
                 let r = frame
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0).color(fg)).sense(Sense::click()).selectable(false))
+                        // One line per message: what does not fit is cut off with "…".
+                        ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0).color(fg)).sense(Sense::click()).selectable(false).truncate())
                     })
                     .inner;
                 if r.double_clicked() {
@@ -379,7 +376,7 @@ impl FtPanel {
         egui::ScrollArea::vertical().id_salt("qso_lines").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for (l, c) in &self.qso_lines {
-                ui.label(RichText::new(l).monospace().size(12.0).color(*c));
+                ui.add(egui::Label::new(RichText::new(l).monospace().size(12.0).color(*c)).truncate());
             }
         });
     }
