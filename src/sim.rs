@@ -48,7 +48,7 @@ enum Kind {
     /// Voice-like SSB: three formants with syllables, talking now and then.
     Voice { phase: f64 },
     /// An FT8 transmission at `audio` Hz above 10489.540 MHz, in even or odd slots.
-    Ft8 { audio: f64, odd: bool },
+    Ft8 { audio: f64, odd: bool, text: &'static str },
 }
 
 struct Signal {
@@ -56,6 +56,8 @@ struct Signal {
     amp: f32,
     kind: Kind,
     mixers: Vec<Mixer>,
+    /// FT8: the tones of its message.
+    tones: Vec<usize>,
     /// Amplitude of each mixer's part for the current block.
     part_amps: Vec<f32>,
     /// PSK: current sign, its smoothed value (soft phase changes keep the spectrum
@@ -105,6 +107,8 @@ pub struct SimRx {
     rate: f64,
     gain: f32,
     started: Instant,
+    /// UTC at `started` (FT8 keeps to the clock's slots).
+    utc0: f64,
     produced: u64,
     seed: u32,
     signals: Vec<Signal>,
@@ -121,6 +125,10 @@ pub struct SimRx {
 }
 
 /// LNB error at `t` seconds (Hz): 3 kHz off, warming by 300 Hz over some minutes.
+fn utc_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
 fn lnb_error(t: f64) -> f64 {
     3_000.0 + 300.0 * (1.0 - (-t / 300.0).exp())
 }
@@ -132,16 +140,20 @@ impl SimRx {
                 Kind::Voice { .. } => 3,
                 _ => 1,
             };
-            Signal { rf_hz, amp, kind, mixers: (0..tones).map(|_| Mixer::new(0.0, 2.4e6)).collect(), part_amps: Vec::new(), sign: 1.0, smooth: 1.0, left: 0 }
+            let ft8 = match kind {
+                Kind::Ft8 { text, .. } => crate::ft8::encode::tones(&crate::ft8::FT8, text).expect("simulated FT8 message"),
+                _ => Vec::new(),
+            };
+            Signal { rf_hz, amp, kind, mixers: (0..tones).map(|_| Mixer::new(0.0, 2.4e6)).collect(), tones: ft8, part_amps: Vec::new(), sign: 1.0, smooth: 1.0, left: 0 }
         };
         let signals = vec![
             signal(10_489.500e6, 0.05, Kind::Beacon),
             signal(10_489.750e6, 0.012, Kind::Psk),
             signal(10_490.000e6, 0.04, Kind::Beacon),
             signal(10_489.512e6, 0.02, Kind::Cw),
-            signal(10_489.540e6, 0.006, Kind::Ft8 { audio: 1_243.0, odd: false }),
-            signal(10_489.540e6, 0.004, Kind::Ft8 { audio: 870.0, odd: true }),
-            signal(10_489.540e6, 0.003, Kind::Ft8 { audio: 1_810.0, odd: false }),
+            signal(10_489.540e6, 0.006, Kind::Ft8 { audio: 1_243.0, odd: false, text: "CQ DL1ABC JO62" }),
+            signal(10_489.540e6, 0.004, Kind::Ft8 { audio: 870.0, odd: true, text: "CQ EA7HJ IM76" }),
+            signal(10_489.540e6, 0.003, Kind::Ft8 { audio: 1_810.0, odd: false, text: "G4ABC SP9UNU -08" }),
             signal(10_489.600e6, 0.015, Kind::Voice { phase: 0.0 }),
             signal(10_489.668e6, 0.025, Kind::Voice { phase: 7.0 }),
             signal(10_489.705e6, 0.012, Kind::Voice { phase: 3.0 }),
@@ -163,6 +175,7 @@ impl SimRx {
             rate: 2.4e6,
             gain: 1.0,
             started: Instant::now(),
+            utc0: utc_now(),
             produced: 0,
             seed: 12_345,
             signals,
@@ -206,61 +219,19 @@ impl SimRx {
                 let a = if talking { s.amp * (0.2 + 0.8 * syllable) } else { 0.0 };
                 vec![(base + 450.0 + wobble, a), (base + 1_050.0 + wobble * 1.5, a * 0.6), (base + 1_800.0 + wobble * 2.0, a * 0.35)]
             }
-            Kind::Ft8 { audio, odd } => {
-                let slot = (t / 15.0) as u64;
-                let into = t % 15.0;
+            Kind::Ft8 { audio, odd, .. } => {
+                let utc = self.utc0 + t;
+                let slot = (utc / 15.0) as u64;
+                let into = utc % 15.0;
                 let active = (slot % 2 == 1) == odd && (0.5..13.14).contains(&into);
-                let symbol = ((into - 0.5) / 0.16) as u64;
-                let tone = (symbol.wrapping_mul(2_654_435_761).wrapping_add(audio as u64) >> 7) % 8;
-                vec![(base + audio + tone as f64 * 6.25, if active { s.amp } else { 0.0 })]
+                let symbol = (((into - 0.5) / 0.16).max(0.0) as usize).min(s.tones.len() - 1);
+                vec![(base + audio + s.tones[symbol] as f64 * 6.25, if active { s.amp } else { 0.0 })]
             }
         }
     }
-}
 
-impl RxDevice for SimRx {
-    fn read(&mut self, out: &mut [Complex<f32>]) -> Result<usize, String> {
-        // Real time: wait until these samples would have arrived.
-        let due = self.started + Duration::from_secs_f64((self.produced + out.len() as u64) as f64 / self.rate);
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            std::thread::sleep(wait);
-        }
-        let t = self.produced as f64 / self.rate;
-        let err = lnb_error(t);
-        let if_of = |rf: f64| rf - self.lnb_lo_hz - err;
-        for i in 0..self.signals.len() {
-            let base = if_of(self.signals[i].rf_hz) - self.center_hz;
-            let parts = self.parts(&self.signals[i], t, base);
-            for (m, (hz, _)) in self.signals[i].mixers.iter_mut().zip(&parts) {
-                m.set(*hz);
-            }
-            // Amplitudes ride along in the mixers' order.
-            self.signals[i].amp_parts(parts.iter().map(|p| p.1));
-        }
-        // One's own signal back from the satellite.
-        let n = out.len();
-        let ratio = *self.shared.rate.lock().unwrap() / self.rate;
-        let sent: Vec<Complex<f32>> = {
-            let mut q = self.shared.queue.lock().unwrap();
-            (0..n)
-                .map(|_| {
-                    self.echo_phase += ratio;
-                    while self.echo_phase >= 1.0 {
-                        self.echo_phase -= 1.0;
-                        self.echo_prev = self.echo_cur;
-                        self.echo_cur = q.pop_front().unwrap_or_default();
-                    }
-                    self.echo_prev + (self.echo_cur - self.echo_prev) * self.echo_phase as f32
-                })
-                .collect()
-        };
-        if self.echo.len() < (ECHO_DELAY_S * self.rate) as usize {
-            self.echo.extend(std::iter::repeat_n(Complex::default(), (ECHO_DELAY_S * self.rate) as usize - self.echo.len()));
-        }
-        self.echo.extend(sent);
-        let tx_lo = *self.shared.tx_lo_hz.lock().unwrap();
-        self.echo_mixer.set(if_of(tx_lo + TX_ERROR_HZ + TRANSLATION_HZ) - self.center_hz);
-
+    /// Noise, the signals and the echo for the samples of `out`.
+    fn fill(&mut self, out: &mut [Complex<f32>]) {
         for z in out.iter_mut() {
             let mut v = Complex::new(self.noise(), self.noise()) * NOISE;
             for s in self.signals.iter_mut() {
@@ -286,6 +257,59 @@ impl RxDevice for SimRx {
             v += self.echo_mixer.next() * back;
             *z = v * self.gain;
         }
+    }
+}
+
+impl RxDevice for SimRx {
+    fn read(&mut self, out: &mut [Complex<f32>]) -> Result<usize, String> {
+        // Real time: wait until these samples would have arrived.
+        let due = self.started + Duration::from_secs_f64((self.produced + out.len() as u64) as f64 / self.rate);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let t = self.produced as f64 / self.rate;
+        let err = lnb_error(t);
+        let if_of = |rf: f64| rf - self.lnb_lo_hz - err;
+        // One's own signal back from the satellite.
+        let n = out.len();
+        let ratio = *self.shared.rate.lock().unwrap() / self.rate;
+        let sent: Vec<Complex<f32>> = {
+            let mut q = self.shared.queue.lock().unwrap();
+            (0..n)
+                .map(|_| {
+                    self.echo_phase += ratio;
+                    while self.echo_phase >= 1.0 {
+                        self.echo_phase -= 1.0;
+                        self.echo_prev = self.echo_cur;
+                        self.echo_cur = q.pop_front().unwrap_or_default();
+                    }
+                    self.echo_prev + (self.echo_cur - self.echo_prev) * self.echo_phase as f32
+                })
+                .collect()
+        };
+        if self.echo.len() < (ECHO_DELAY_S * self.rate) as usize {
+            self.echo.extend(std::iter::repeat_n(Complex::default(), (ECHO_DELAY_S * self.rate) as usize - self.echo.len()));
+        }
+        self.echo.extend(sent);
+        let tx_lo = *self.shared.tx_lo_hz.lock().unwrap();
+        self.echo_mixer.set(if_of(tx_lo + TX_ERROR_HZ + TRANSLATION_HZ) - self.center_hz);
+
+        // In 1 ms pieces, each with the signals' parts of its time (FT8 symbols change
+        // on time).
+        let piece = ((self.rate / 1_000.0) as usize).max(1);
+        for (k, chunk) in out.chunks_mut(piece).enumerate() {
+            let tk = (self.produced + (k * piece) as u64) as f64 / self.rate;
+            for i in 0..self.signals.len() {
+                let base = self.signals[i].rf_hz - self.lnb_lo_hz - err - self.center_hz;
+                let parts = self.parts(&self.signals[i], tk, base);
+                for (m, (hz, _)) in self.signals[i].mixers.iter_mut().zip(&parts) {
+                    m.set(*hz);
+                }
+                // Amplitudes ride along in the mixers' order.
+                self.signals[i].amp_parts(parts.iter().map(|p| p.1));
+            }
+            self.fill(chunk);
+        }
         self.produced += n as u64;
         Ok(n)
     }
@@ -305,6 +329,7 @@ impl RxDevice for SimRx {
         self.psk_smoothing = psk_smoothing(rate);
         self.echo.clear();
         self.started = Instant::now();
+        self.utc0 = utc_now();
         self.produced = 0;
         Ok(())
     }

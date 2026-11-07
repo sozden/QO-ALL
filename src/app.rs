@@ -13,9 +13,11 @@ use qo_all::ft8::worker::Ft8Message;
 use qo_all::iio;
 use qo_all::listen::ListenSettings;
 use qo_all::source::{FRAME_POINTS, Frame, View};
+use qo_all::ft8::{FT4, FT8, Protocol};
 use qo_all::tune;
 use qo_all::vox::{Blocked, TxState, VoxSettings};
 
+use crate::ftpanel::{self, FtPanel};
 use crate::settings::Settings;
 use crate::ui::{self, palette::*};
 
@@ -118,6 +120,14 @@ pub struct App {
     edit_speaker: Option<String>,
     usb_found: Vec<(String, String)>,
     mics: Vec<qo_all::audio::OutputDevice>,
+    /// FT8 or FT4 (the receiver then works in USB on the FT dial), and the SSB dial to
+    /// go back to.
+    digital: Option<&'static Protocol>,
+    ssb_dial: f64,
+    ft: FtPanel,
+    edit_call: String,
+    edit_grid: String,
+    edit_log: String,
     speakers: Vec<qo_all::audio::OutputDevice>,
 }
 
@@ -217,6 +227,17 @@ impl App {
             edit_speaker: config.speaker.clone(),
             usb_found: Vec::new(),
             mics: Vec::new(),
+            // The last mode, FT8/FT4 included.
+            digital: match s.text("digital").as_deref() {
+                Some("FT8") => Some(&FT8),
+                Some("FT4") => Some(&FT4),
+                _ => None,
+            },
+            ssb_dial: s.get("ssb_dial_hz").unwrap_or(rx_dial),
+            ft: FtPanel::new(&s),
+            edit_call: s.text("my_call").unwrap_or_default(),
+            edit_grid: s.text("my_grid").unwrap_or_default(),
+            edit_log: s.text("adif_path").unwrap_or_else(|| ftpanel::default_log().display().to_string()),
             speakers: Vec::new(),
             config,
             engine: None,
@@ -227,6 +248,12 @@ impl App {
             rate: 0.0,
             settings: s,
         };
+        // Starting in FT8/FT4: the receiver on the FT dial.
+        if app.digital.is_some() && (app.rx_dial - FT_DIAL_HZ).abs() > 3e3 {
+            app.rx_dial = FT_DIAL_HZ;
+            app.zoom_center = FT_DIAL_HZ;
+            app.linked = true;
+        }
         app.start(&cc.egui_ctx);
         app
     }
@@ -283,10 +310,34 @@ impl App {
         bandplan::uplink(self.tx_signal()) + self.tx_correction
     }
 
-    /// Band plan check of the transmitted signal.
+    /// Band plan check of the transmitted signal (in FT8/FT4 only its tones).
     fn tx_band(&self) -> Result<(), Refusal> {
         let d = self.tx_signal();
-        bandplan::check(d + qo_all::tx::AUDIO_LOW, d + qo_all::tx::AUDIO_HIGH)
+        match self.digital {
+            Some(p) => bandplan::check(d + self.ft.audio_hz, d + self.ft.audio_hz + FtPanel::signal_width(p)),
+            None => bandplan::check(d + qo_all::tx::AUDIO_LOW, d + qo_all::tx::AUDIO_HIGH),
+        }
+    }
+
+    /// Switches between the voice modes and FT8/FT4.
+    fn set_digital(&mut self, d: Option<&'static Protocol>) {
+        if d.is_some() && self.digital.is_none() {
+            self.ssb_dial = self.rx_dial;
+            self.tune_rx(FT_DIAL_HZ);
+            self.linked = true;
+            self.mode = Mode::Usb;
+        }
+        if d.is_none() && self.digital.is_some() {
+            self.ft.halt(self.engine.as_ref());
+            self.tune_rx(self.ssb_dial);
+        }
+        if d.is_some() && !std::ptr::eq(d.unwrap(), self.digital.unwrap_or(d.unwrap())) {
+            // FT8 ↔ FT4: what was scheduled belongs to the other one.
+            self.ft.halt(self.engine.as_ref());
+        }
+        self.digital = d;
+        self.ptt_latched = false;
+        self.tune = false;
     }
 
     fn view_band(&self) -> (f64, f64) {
@@ -320,12 +371,16 @@ impl App {
             tx.armed = self.armed && self.mode != Mode::Cw;
             tx.tune = self.tune && tx.armed;
             tx.band = self.tx_band();
+            tx.digital = self.digital.is_some();
             tx.time_out = Duration::from_secs(self.time_out_s as u64);
         }
-        e.ft8.set_dial(Some(to_if(FT_DIAL_HZ)));
+        // In FT8/FT4 the decoders follow the dial; otherwise FT8 runs on its usual one.
+        let ft_dial = if self.digital.is_some() { self.rx_dial } else { FT_DIAL_HZ };
+        e.ft8.set_dial(Some(to_if(ft_dial)));
         // The own signal's carrier should come down on the transmit dial (plus XIT).
         e.selfcheck.set_expected(Some(to_if(self.tx_signal())));
-        e.ft4.set_dial(self.ft4_on.then(|| to_if(FT_DIAL_HZ)));
+        let ft4 = self.ft4_on || self.digital.is_some_and(|p| std::ptr::eq(p, &FT4));
+        e.ft4.set_dial(ft4.then(|| to_if(ft_dial)));
         let (lo, hi) = self.view_band();
         let view = View { offset_hz: to_if((lo + hi) / 2.0) - self.config.center_if(), span_hz: hi - lo };
         *e.view.lock().unwrap() = view;
@@ -442,6 +497,9 @@ impl App {
         s.set("volume", self.volume);
         s.set("zoom", self.zoom);
         s.set("ft4", self.ft4_on);
+        self.ft.save(s);
+        s.set("digital", self.digital.map_or("", |p| p.name));
+        s.set("ssb_dial_hz", self.ssb_dial);
         s.save();
     }
 
@@ -573,8 +631,15 @@ impl App {
         });
         ui.horizontal(|ui| {
             for m in MODES {
-                if ui::choice(ui, m.name(), self.mode == m, RX) {
+                if ui::choice(ui, m.name(), self.mode == m && self.digital.is_none(), RX) {
+                    self.set_digital(None);
                     self.mode = m;
+                }
+            }
+            for p in [&FT8, &FT4] {
+                let on = self.digital.is_some_and(|d| std::ptr::eq(d, p));
+                if ui::choice(ui, p.name, on, RX) && !on {
+                    self.set_digital(Some(p));
                 }
             }
             ui.add_space(12.0);
@@ -683,9 +748,17 @@ impl App {
         painter.line_segment([pos2(rx_x, rect.top()), pos2(rx_x, rect.bottom())], Stroke::new(1.5, RX));
         painter.text(pos2(rx_x + 5.0, rect.top() + 3.0), Align2::LEFT_TOP, "RX", FontId::proportional(12.0), RX);
         // Transmitter dial.
-        let tx_x = x_of(self.tx_signal());
-        ui::dashed_vline(&painter, tx_x, rect.top(), rect.bottom(), Stroke::new(1.5, TX));
-        painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
+        if let Some(p) = self.digital {
+            // FT8/FT4: the tones' place.
+            let a = self.tx_signal() + self.ft.audio_hz;
+            let r = Rect::from_min_max(pos2(x_of(a), rect.top()), pos2(x_of(a + FtPanel::signal_width(p)).max(x_of(a) + 2.0), rect.bottom()));
+            painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.5, TX), egui::StrokeKind::Middle);
+            painter.text(pos2(r.left() - 4.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
+        } else {
+            let tx_x = x_of(self.tx_signal());
+            ui::dashed_vline(&painter, tx_x, rect.top(), rect.bottom(), Stroke::new(1.5, TX));
+            painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
+        }
 
         // Hover readout.
         if let Some(p) = response.hover_pos() {
@@ -707,10 +780,16 @@ impl App {
             }
         };
         if response.clicked()
-            && let Some(p) = response.interact_pointer_pos()
+            && let Some(pos) = response.interact_pointer_pos()
         {
-            let hz = place(self, p.x);
-            self.tune_rx(hz);
+            if let Some(p) = self.digital {
+                // FT8/FT4: a click sets where the own tones go (the dial stays).
+                let max = 2_700.0 - FtPanel::signal_width(p);
+                self.ft.audio_hz = (hz_of(pos.x) - self.tx_signal()).clamp(300.0, max).round();
+            } else {
+                let hz = place(self, pos.x);
+                self.tune_rx(hz);
+            }
         }
         if response.secondary_clicked()
             && let Some(p) = response.interact_pointer_pos()
@@ -850,13 +929,20 @@ impl App {
             ui.add(egui::Slider::new(&mut power, -MAX_ATTENUATION..=0.0).suffix(" dB").step_by(0.5));
             self.attenuation = -power;
             ui.add_space(2.0);
-            let tune_text = self.t("Tune 1 kHz", "Ton 1 kHz");
-            if ui::choice(ui, tune_text, self.tune, TX) && can && self.armed {
-                self.tune = !self.tune;
-            }
             let on = status.state == TxState::Transmit;
-            if ui::ptt_button(ui, self.ptt_latched || on, can && self.armed) && can && self.armed {
-                self.ptt_latched = !self.ptt_latched;
+            // In FT8/FT4 the sequence keys the transmitter: no PTT, no tune tone.
+            if self.digital.is_none() {
+                let tune_text = self.t("Tune 1 kHz", "Ton 1 kHz");
+                if ui::choice(ui, tune_text, self.tune, TX) && can && self.armed {
+                    self.tune = !self.tune;
+                }
+                if ui::ptt_button(ui, self.ptt_latched || on, can && self.armed) && can && self.armed {
+                    self.ptt_latched = !self.ptt_latched;
+                }
+            } else {
+                let text = if on { "TX" } else { "RX" };
+                let color = if on { TX } else { DIM };
+                ui.label(RichText::new(text).size(28.0).strong().color(color));
             }
             let state = match status.state {
                 TxState::Transmit => match status.remaining {
@@ -903,6 +989,44 @@ impl App {
             if self.mode == Mode::Cw {
                 ui.label(RichText::new(self.t("CW sending comes later", "CW gönderimi sonraki sürümde")).size(11.0).color(DIM));
             }
+        });
+    }
+
+    /// FT8/FT4: band activity, the contact, the controls and the transmitter.
+    fn ft_cards(&mut self, ui: &mut egui::Ui, p: &'static Protocol, h: f32) {
+        let tr = self.lang == Lang::Tr;
+        let armed = self.armed && matches!(self.tx_capable, Some(Ok(())));
+        ui.horizontal_top(|ui| {
+            let w = ui.available_width();
+            let (qso, controls, tx) = (340.0f32.min(w * 0.25), 360.0f32, 200.0f32);
+            let activity = (w - qso - controls - tx - 3.0 * ui.spacing().item_spacing.x - 40.0).max(260.0);
+            let column = egui::Layout::top_down(egui::Align::Min);
+            ui.allocate_ui_with_layout(vec2(activity, h), column, |ui| {
+                ui::card(ui, DEEP, |ui| {
+                    ui.set_min_size(vec2(ui.available_width(), h - 18.0));
+                    if let Some(e) = self.engine.as_ref() {
+                        self.ft.activity(ui, e, p, tr);
+                    }
+                });
+            });
+            ui.allocate_ui_with_layout(vec2(qso, h), column, |ui| {
+                ui::card(ui, DEEP, |ui| {
+                    ui.set_min_size(vec2(ui.available_width(), h - 18.0));
+                    self.ft.qso_pane(ui, tr);
+                });
+            });
+            ui.allocate_ui_with_layout(vec2(controls, h), column, |ui| {
+                ui::card(ui, CARD, |ui| {
+                    ui.set_min_size(vec2(ui.available_width(), h - 18.0));
+                    self.ft.controls(ui, self.engine.as_ref(), p, armed, tr);
+                });
+            });
+            ui.allocate_ui_with_layout(vec2(tx, h), column, |ui| {
+                ui::card(ui, CARD, |ui| {
+                    ui.set_min_size(vec2(ui.available_width(), h - 18.0));
+                    self.transmit(ui);
+                });
+            });
         });
     }
 
@@ -989,6 +1113,29 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.time_out_s, 30..=600).suffix(" s").step_by(10.0));
             });
             ui.add_space(8.0);
+            ui::caption(ui, self.t("STATION AND LOG (FT8/FT4)", "İSTASYON VE LOG (FT8/FT4)"), BLUE);
+            egui::Grid::new("station").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                ui.label(self.t("Call sign", "Çağrı işareti"));
+                ui.add(egui::TextEdit::singleline(&mut self.edit_call).desired_width(120.0).char_limit(11));
+                ui.end_row();
+                ui.label(self.t("Locator", "Lokatör"));
+                ui.add(egui::TextEdit::singleline(&mut self.edit_grid).desired_width(120.0).char_limit(6));
+                ui.end_row();
+            });
+            ui.label(self.t("ADIF log file", "ADIF log dosyası"));
+            ui.add(egui::TextEdit::singleline(&mut self.edit_log).desired_width(ui.available_width() - 10.0));
+            ui.horizontal(|ui| {
+                if ui.button(self.t("QO-ALL's own", "QO-ALL'ın kendi")).clicked() {
+                    self.edit_log = ftpanel::default_log().display().to_string();
+                }
+                if let Some(w) = ftpanel::wsjtx_log()
+                    && ui.button(self.t("WSJT-X's log", "WSJT-X logu")).clicked()
+                {
+                    self.edit_log = w.display().to_string();
+                }
+            });
+            ui.label(RichText::new(format!("{} {}", self.ft.worked.len(), self.t("stations in the log", "istasyon logda"))).size(11.0).color(DIM));
+            ui.add_space(8.0);
             ui::caption(ui, self.t("SOUND", "SES"), GOOD);
             let default = self.t("System default", "Sistem varsayılanı");
             let name_of = |list: &[qo_all::audio::OutputDevice], id: &Option<String>| {
@@ -1020,6 +1167,7 @@ impl App {
                 self.config.rx_gain = (!self.edit_auto_gain).then_some(self.edit_gain);
                 self.config.microphone = self.edit_mic.clone();
                 self.config.speaker = self.edit_speaker.clone();
+                self.ft.set_station(&self.edit_call, &self.edit_grid, std::path::PathBuf::from(self.edit_log.trim()));
                 self.save();
                 self.start(ui.ctx());
                 self.show_settings = false;
@@ -1073,6 +1221,11 @@ impl eframe::App for App {
         let ptt = self.armed && (self.ptt_latched || (space && !typing));
         self.set_ptt(ptt);
         self.sync();
+        if let (Some(p), Some(e)) = (self.digital, self.engine.as_ref()) {
+            let (dial, uplink) = (self.tx_signal(), self.uplink());
+            let armed = self.armed && matches!(self.tx_capable, Some(Ok(())));
+            self.ft.update(e, p, armed, dial, uplink, self.lang == Lang::Tr);
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(200));
 
         let bar = egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6));
@@ -1092,6 +1245,10 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 let h = ui.available_height();
+                if let Some(p) = self.digital {
+                    self.ft_cards(ui, p, h);
+                    return;
+                }
                 ui.horizontal_top(|ui| {
                     let w = ui.available_width();
                     let side = 380.0f32.min(w * 0.36);

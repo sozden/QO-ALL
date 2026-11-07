@@ -4,8 +4,10 @@
 //! encoding constants come from WSJT-X.
 
 pub mod decode;
+pub mod encode;
 pub mod ldpc;
 pub mod message;
+pub mod qso;
 pub mod tables;
 pub mod worker;
 

@@ -382,7 +382,25 @@ fn try_candidates(
     used: &mut Vec<(f64, f64)>,
 ) {
     let spacing = p.tone_spacing();
-    for &(_, t0, f) in candidates {
+    // Refinement and LDPC decoding of every candidate, spread over the processor's
+    // cores (it is most of the time a slot takes; an answer has to go out at the start
+    // of the next slot). What follows, in the candidates' order, is the same as one by
+    // one: candidates next to a decoded transmission are passed over there.
+    let attempt = |&(_, t0, f): &(f32, usize, usize)| {
+        let coarse_hz = spec.first_hz + f as f64 * spec.bin_hz;
+        let fine = refine(p, samples, t0, coarse_hz, taps, wide)?;
+        // One frequency first; if that fails, the frequency followed block by block.
+        let (word, power) =
+            [&fine.power, &fine.tracked].into_iter().find_map(|pw| decoder.decode(&soft_bits(p, pw), 30).map(|w| (w, pw.clone())))?;
+        Some((fine.start_s, fine.freq_hz, word, power))
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 16);
+    let chunk = candidates.len().div_ceil(threads).max(1);
+    let attempts: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(attempt).collect::<Vec<_>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().expect("decoder thread")).collect()
+    });
+    for (&(_, t0, f), result) in candidates.iter().zip(attempts) {
         let coarse_hz = spec.first_hz + f as f64 * spec.bin_hz;
         let coarse_s = (t0 * spec.step) as f64 / p.rate;
         // A decoded transmission also leaves sync peaks next to itself.
@@ -390,14 +408,7 @@ fn try_candidates(
         if used.iter().any(|&(s, hz)| (s - coarse_s).abs() < 1.25 * p.sps as f64 / p.rate && (hz - coarse_hz).abs() < near) {
             continue;
         }
-        let Some(fine) = refine(p, samples, t0, coarse_hz, taps, wide) else { continue };
-        // One frequency first; if that fails, the frequency followed block by block.
-        let Some((word, power)) = [&fine.power, &fine.tracked]
-            .into_iter()
-            .find_map(|pw| decoder.decode(&soft_bits(p, pw), 30).map(|w| (w, pw)))
-        else {
-            continue;
-        };
+        let Some((start_s, freq_hz, word, power)) = result else { continue };
         let msg = &word[..77];
         if msg.iter().all(|&b| b == 0) {
             continue;
@@ -412,7 +423,7 @@ fn try_candidates(
             None => msg.to_vec(),
         };
         let Some(text) = message::unpack(&bits, book) else { continue };
-        used.push((fine.start_s, fine.freq_hz));
+        used.push((start_s, freq_hz));
         if found.iter().any(|d| d.text == text) {
             continue;
         }
@@ -431,8 +442,8 @@ fn try_candidates(
         found.push(Decoded {
             text,
             snr_db: snr as f32,
-            dt_s: (fine.start_s - p.early_s - p.start_s) as f32,
-            freq_hz: fine.freq_hz,
+            dt_s: (start_s - p.early_s - p.start_s) as f32,
+            freq_hz,
         });
     }
 }
@@ -610,5 +621,21 @@ pub mod tests {
         db.iter_mut().for_each(|v| *v = ((*v - lo) / (hi - lo)).clamp(0.0, 1.0) * 255.0);
         std::fs::write(&out, db.iter().map(|v| *v as u8).collect::<Vec<u8>>()).unwrap();
         println!("size {}x{}", spec.width, spec.rows);
+    }
+
+    /// Decoding time of a busy slot (20 signals): `cargo test --release --lib busy_slot_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn busy_slot_speed() {
+        for p in [&FT8, &FT4] {
+            let mut x = noise(slot_samples(p), 1.0, 7);
+            for k in 0..20 {
+                let text = format!("CQ TA{}ABC KM{:02}", k % 10, k);
+                add_drifting(p, &mut x, &text, -1400.0 + k as f64 * 140.0, 0.3 + (k % 5) as f64 * 0.2, amplitude_at(p, -12.0 + (k % 7) as f64 * 2.0), 0.0);
+            }
+            let t = std::time::Instant::now();
+            let found = decode_slot(p, &x, -1500.0, 1500.0, &mut CallBook::default());
+            println!("{}: {} of 20 in {:.2} s", p.name, found.len(), t.elapsed().as_secs_f64());
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! The library holds everything that does not need a window, so that it can be tested
 //! on its own.
 
+pub mod adif;
 pub mod audio;
 pub mod bandplan;
 pub mod beacon;

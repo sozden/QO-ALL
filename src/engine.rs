@@ -143,6 +143,8 @@ pub struct TxSettings {
     /// Sends a steady 1 kHz tone instead of the microphone (setting the power, finding
     /// one's own signal on the waterfall).
     pub tune: bool,
+    /// FT8/FT4: the transmitter sends the scheduled digital jobs, not the microphone.
+    pub digital: bool,
     /// Band plan check of the signal's place.
     pub band: Result<(), Refusal>,
     pub time_out: Duration,
@@ -160,6 +162,7 @@ impl Default for TxSettings {
             armed: false,
             ptt: false,
             tune: false,
+            digital: false,
             band: Ok(()),
             time_out: crate::vox::DEFAULT_TIME_OUT,
         }
@@ -179,13 +182,41 @@ pub struct TxStatus {
     pub remaining: Option<Duration>,
     /// Samples per second handed to the radio while transmitting (should be its rate).
     pub sent_rate: f64,
+    /// The last digital job that started going out, and the last one dropped for being
+    /// too late.
+    pub digital_started: Option<u64>,
+    pub digital_missed: Option<u64>,
     pub error: Option<String>,
 }
 
 impl Default for TxStatus {
     fn default() -> Self {
-        Self { state: TxState::Receive, mic_db: -150.0, vox_keyed: false, alc_db: 0.0, remaining: None, sent_rate: 0.0, error: None }
+        Self { state: TxState::Receive, mic_db: -150.0, vox_keyed: false, alc_db: 0.0, remaining: None, sent_rate: 0.0, digital_started: None, digital_missed: None, error: None }
     }
+}
+
+/// An FT8/FT4 transmission waiting for its time.
+#[derive(Clone, Debug)]
+pub struct DigitalJob {
+    pub id: u64,
+    /// When the audio has to start (Unix seconds, UTC).
+    pub start_utc: f64,
+    /// Starting later than this after `start_utc` is no use: the job is dropped (s).
+    pub max_late_s: f64,
+    /// Audio at the microphone's rate.
+    pub audio: Arc<Vec<f32>>,
+}
+
+/// The window's hand-over of digital transmissions.
+#[derive(Debug, Default)]
+pub struct DigitalState {
+    pub job: Option<DigitalJob>,
+    /// Stops a transmission at once (Halt).
+    pub halt: bool,
+}
+
+fn now_utc() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// The running station. Dropping it stops the threads and closes the radio.
@@ -202,6 +233,9 @@ pub struct Engine {
     pub ft4: Ft8,
     /// Finds the own signal on the downlink (automatic uplink correction).
     pub selfcheck: SelfCheck,
+    /// FT8/FT4 transmissions to send, and the rate their audio is made at.
+    pub digital: Arc<Mutex<DigitalState>>,
+    pub mic_rate: f64,
     pub tx: Arc<Mutex<TxSettings>>,
     pub tx_status: Arc<Mutex<TxStatus>>,
     /// Name of the open microphone and speaker, or why they could not be opened.
@@ -275,6 +309,7 @@ impl Engine {
             Err(e) => (None, Err(e)),
         };
         let mic_rate = mic.as_ref().map_or(48_000.0, |m| m.sample_rate as f64);
+        let digital = Arc::new(Mutex::new(DigitalState::default()));
         let tx_settings = Arc::new(Mutex::new(tx));
         let tx_status = Arc::new(Mutex::new(TxStatus::default()));
         let (handoff_tx, handoff_rx) = mpsc::sync_channel::<Box<dyn TxDevice>>(1);
@@ -287,6 +322,7 @@ impl Engine {
                 mic_rate,
                 listener: listener.clone(),
                 selfcheck: selfcheck.clone(),
+                digital: digital.clone(),
                 stop: stop.clone(),
                 tx_lo_hz: config.tx_lo_hz,
                 rate: config.tx_rate(),
@@ -321,6 +357,8 @@ impl Engine {
             ft8,
             ft4,
             selfcheck,
+            digital,
+            mic_rate,
             tx: tx_settings,
             tx_status,
             microphone,
@@ -421,6 +459,7 @@ struct TxLink {
     mic_rate: f64,
     listener: Listener,
     selfcheck: SelfCheck,
+    digital: Arc<Mutex<DigitalState>>,
     stop: Arc<AtomicBool>,
     tx_lo_hz: f64,
     rate: f64,
@@ -446,6 +485,10 @@ fn transmit(link: TxLink) {
     let mut last_state = TxState::Receive;
     let mut error: Option<String> = None;
     let mut tune_phase = 0.0f64;
+    // The digital job going out: its id, audio and how far it has been sent.
+    let mut feed: Option<(u64, Arc<Vec<f32>>, usize)> = None;
+    let mut digital_started = None;
+    let mut digital_missed = None;
     // Samples sent in the current second, and the rate of the last one.
     let mut sent = (Instant::now(), 0usize);
     let mut sent_rate = 0.0;
@@ -468,8 +511,17 @@ fn transmit(link: TxLink) {
         }
         // While the tune tone goes out, the radio's write paces the loop: no waiting for
         // the microphone, or the radio would be fed slower than real time.
+        // A digital job going out is paced the same way; one about to start is waited
+        // for in short steps, so it starts on time.
         let tuning = on && link.settings.lock().unwrap().tune;
-        let wait = if tuning { Duration::ZERO } else { Duration::from_millis(20) };
+        let soon = link.digital.lock().unwrap().job.as_ref().is_some_and(|j| j.start_utc - now_utc() < 0.05);
+        let wait = if tuning || (on && feed.is_some()) {
+            Duration::ZERO
+        } else if soon {
+            Duration::from_millis(2)
+        } else {
+            Duration::from_millis(20)
+        };
         let chunk = match &link.mic {
             Some(rx) => match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
@@ -495,7 +547,42 @@ fn transmit(link: TxLink) {
         }
         let offset = s.uplink_hz - link.tx_lo_hz;
         let band = if offset.abs() > link.rate / 2.0 - TX_EDGE_HZ { Err(Refusal::OutsideTransponder) } else { s.band };
-        let state = control.update(Instant::now(), s.ptt || s.tune || vox.keyed(), s.armed, device.is_some(), band);
+        // FT8/FT4: the scheduled audio instead of the microphone.
+        let mut digital_on = false;
+        if s.digital {
+            pending.clear();
+            let mut d = link.digital.lock().unwrap();
+            if std::mem::take(&mut d.halt) {
+                feed = None;
+                d.job = None;
+            }
+            if feed.is_none()
+                && let Some(job) = d.job.as_ref()
+                && now_utc() >= job.start_utc
+            {
+                let job = d.job.take().expect("job");
+                if now_utc() - job.start_utc > job.max_late_s {
+                    digital_missed = Some(job.id);
+                } else {
+                    digital_started = Some(job.id);
+                    feed = Some((job.id, job.audio, 0));
+                }
+            }
+            drop(d);
+            if let Some((_, audio, pos)) = feed.as_mut() {
+                let n = ((link.mic_rate * TUNE_CHUNK_S) as usize).min(audio.len() - *pos);
+                pending.extend(&audio[*pos..*pos + n]);
+                *pos += n;
+                digital_on = true;
+                if *pos >= audio.len() {
+                    feed = None;
+                }
+            }
+        } else {
+            feed = None;
+        }
+        let keyed = if s.digital { digital_on } else { s.ptt || s.tune || vox.keyed() };
+        let state = control.update(Instant::now(), keyed, s.armed, device.is_some(), band);
         if s.tune {
             // The tone replaces the microphone.
             pending.clear();
@@ -514,8 +601,9 @@ fn transmit(link: TxLink) {
                 modulator = Some(SsbModulator::new(s.mode, link.mic_rate, link.rate));
             }
             let m = modulator.as_mut().expect("modulator");
-            m.mic_gain = db_to_gain(s.mic_gain_db);
-            m.compress = s.compress;
+            // Digital audio goes out as made: no microphone gain, no compressor.
+            m.mic_gain = if s.digital { 1.0 } else { db_to_gain(s.mic_gain_db) };
+            m.compress = s.compress && !s.digital;
             m.set_offset(offset);
             let mut result = Ok(());
             if attenuation != s.attenuation_db {
@@ -571,6 +659,8 @@ fn transmit(link: TxLink) {
             alc_db: if on { modulator.as_ref().map_or(0.0, |m| m.alc_db) } else { 0.0 },
             remaining: control.remaining(Instant::now()),
             sent_rate,
+            digital_started,
+            digital_missed,
             error: error.clone(),
         };
         drop(st);
@@ -695,5 +785,50 @@ mod tests {
         let m = engine.selfcheck.latest().expect("a self-check measurement");
         println!("self check {m:?}");
         assert!((m.estimate.offset_hz - crate::sim::TX_ERROR_HZ).abs() < 10.0);
+    }
+
+    /// An FT8 transmission scheduled at the next slot comes back from the simulated
+    /// satellite and decodes: `cargo test --release --lib digital_on_simulator -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn digital_on_simulator() {
+        use crate::ft8::{FT8, encode};
+        let config = StationConfig { microphone: Some("none".into()), speaker: Some("none".into()), ..Default::default() }.with_rate(0.6e6);
+        let listen = ListenSettings { dial_hz: 0.0, mode: Mode::Usb, bandwidth_hz: 2.4e3, audio_rate: 48e3, volume: 1.0 };
+        let engine = Engine::start(config, listen, TxSettings::default(), 0.5, || {});
+        // Wait for the beacon lock, then put FT8 on its dial.
+        let started = Instant::now();
+        while engine.correction().is_none() && started.elapsed() < Duration::from_secs(10) {
+            let _ = engine.events.recv_timeout(Duration::from_millis(200));
+        }
+        let dial = 10_489.540e6;
+        let lo = engine.config.lnb_lo_hz;
+        let correction = engine.correction().expect("beacon lock");
+        engine.ft8.set_dial(Some(dial - lo - correction));
+        {
+            let mut tx = engine.tx.lock().unwrap();
+            tx.uplink_hz = crate::bandplan::uplink(dial);
+            tx.armed = true;
+            tx.digital = true;
+        }
+        let text = "CQ TA4SO KM46";
+        let audio = encode::waveform(&FT8, &encode::tones(&FT8, text).unwrap(), 1_500.0, engine.mic_rate, 0.9);
+        let slot = (now_utc() / 15.0).floor() + 1.0;
+        engine.digital.lock().unwrap().job = Some(DigitalJob { id: 7, start_utc: slot * 15.0 + 0.5, max_late_s: 1.0, audio: Arc::new(audio) });
+        println!("transmitting in slot {slot}, {:.1} s from now", slot * 15.0 + 0.5 - now_utc());
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut found = None;
+        while Instant::now() < deadline && found.is_none() {
+            let _ = engine.events.recv_timeout(Duration::from_millis(200));
+            found = engine.ft8.messages().into_iter().find(|m| m.text == text);
+        }
+        let st = engine.tx_status.lock().unwrap().clone();
+        println!("status {st:?}");
+        let m = found.expect("own FT8 transmission decoded");
+        println!("decoded {m:?}");
+        assert_eq!(st.digital_started, Some(7));
+        assert_eq!(m.slot as f64, slot * 15.0);
+        // The simulated transmitter is off by TX_ERROR_HZ.
+        assert!((m.audio_hz - (1_500.0 + crate::sim::TX_ERROR_HZ)).abs() < 10.0);
     }
 }
