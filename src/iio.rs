@@ -386,11 +386,33 @@ impl IioRadio {
         let s = Arc::clone(&self.shared);
         let (phy, rx_config) = (self.phy, self.rx_config);
         let set_rate = || s.write(rx_config, "sampling_frequency", &format!("{}", rate.round() as i64));
+        // Both FIR filters on or off. libiio shows the chip's "in_out_voltage_filter_fir_en"
+        // as the attribute "voltage_filter_fir_en" of the channel "out" (as pyadi-iio
+        // uses it); older set-ups as a device attribute; failing both, the receive and
+        // transmit filters one by one (the Pluto may refuse the transmit one alone).
+        let fir = |on: bool| -> Result<(), String> {
+            let v = if on { "1" } else { "0" };
+            let out = s.channel(phy, "out", false);
+            let first = if out.is_null() { Err("no channel \"out\"".to_string()) } else { s.write(out, "voltage_filter_fir_en", v) };
+            first.or_else(|e1| {
+                s.write_device(phy, "in_out_voltage_filter_fir_en", v).or_else(|e2| {
+                    let tx_config = s.channel(phy, "voltage0", true);
+                    let (rx, tx) = if on {
+                        let rx = s.write(rx_config, "filter_fir_en", v);
+                        (rx, if tx_config.is_null() { Ok(()) } else { s.write(tx_config, "filter_fir_en", v) })
+                    } else {
+                        let tx = if tx_config.is_null() { Ok(()) } else { s.write(tx_config, "filter_fir_en", v) };
+                        (s.write(rx_config, "filter_fir_en", v), tx)
+                    };
+                    rx.and(tx).map_err(|e3| format!("{e1}; {e2}; {e3}"))
+                })
+            })
+        };
         if rate < FIR_RATE_LIMIT {
-            // Our own decimating/interpolating filters with their clock chain: loading
+            // Our own decimating/interpolating filters with their clock chain: enabling
             // them moves the chip to the new rate.
             s.write_device(phy, "filter_fir_config", &low_rate_fir(rate)).map_err(|e| format!("FIR filter not accepted: {e}"))?;
-            let enabled = s.write_device(phy, "in_out_voltage_filter_fir_en", "1");
+            let enabled = fir(true);
             let current = || s.read(rx_config, "sampling_frequency").and_then(|v| v.parse::<f64>().ok());
             if current().is_none_or(|c| (c - rate).abs() > rate * 0.01) {
                 set_rate().map_err(|e| {
@@ -405,21 +427,13 @@ impl IioRadio {
             self.fir_warning = None;
         } else {
             // A FIR filter left loaded by another program (SDR-Console, for its own rate)
-            // cut off part of the band. The Pluto refuses to switch off the transmit
-            // filter alone, so both go off together; failing that, each on its own.
-            // At a rate that needs the filter (ours, from a low-rate run) it cannot be
-            // switched off either: our filter with the new rate's clock chain moves the
-            // chip there first.
-            let off = || s.write_device(phy, "in_out_voltage_filter_fir_en", "0");
-            let first = off().or_else(|e| {
-                s.write_device(phy, "filter_fir_config", &low_rate_fir(rate)).and_then(|_| off()).map_err(|_| e)
+            // cut off part of the band, so it goes off. At a rate that needs the filter
+            // (ours, from a low-rate run) it cannot be switched off: our filter with the
+            // new rate's clock chain moves the chip there first.
+            let first = fir(false).or_else(|e| {
+                s.write_device(phy, "filter_fir_config", &low_rate_fir(rate)).and_then(|_| fir(true)).and_then(|_| fir(false)).map_err(|_| e)
             });
-            self.fir_warning = first.err().and_then(|both| {
-                let tx_config = s.channel(phy, "voltage0", true);
-                let rx = s.write(rx_config, "filter_fir_en", "0");
-                let tx = if tx_config.is_null() { Ok(()) } else { s.write(tx_config, "filter_fir_en", "0") };
-                (rx.is_err() || tx.is_err()).then(|| format!("FIR filter left on ({both})"))
-            });
+            self.fir_warning = first.err().map(|e| format!("FIR filter left on ({e})"));
             set_rate()?;
         }
         let bandwidth = rate.clamp(200_000.0, 56_000_000.0);
@@ -482,8 +496,12 @@ impl IioRadio {
     pub fn describe_tx(&self) -> String {
         let s = &self.shared;
         let mut out = String::new();
-        for attr in ["tx_path_rates", "rx_path_rates", "in_out_voltage_filter_fir_en", "ensm_mode"] {
+        for attr in ["tx_path_rates", "rx_path_rates", "ensm_mode"] {
             out += &format!("{attr}: {}\n", s.read_device(self.phy, attr).unwrap_or_else(|| "?".into()));
+        }
+        let fir = s.channel(self.phy, "out", false);
+        if !fir.is_null() {
+            out += &format!("voltage_filter_fir_en: {}\n", s.read(fir, "voltage_filter_fir_en").unwrap_or_else(|| "?".into()));
         }
         let tx_config = s.channel(self.phy, "voltage0", true);
         let tx_lo = s.channel(self.phy, "altvoltage1", true);
