@@ -591,14 +591,14 @@ mod tests {
     #[test]
     fn low_rate_fits_the_transponder() {
         use crate::bandplan::{RESERVED_HZ, UPLINK_HIGH_HZ, UPLINK_LOW_HZ, downlink};
-        let c = StationConfig::default().with_rate(1.2e6);
+        let c = StationConfig::default().with_rate(0.6e6);
         // The transponder within ±0.45 of the rate around the centre.
         assert!(10_490.01e6 - c.rx_center_hz < 0.45 * c.sample_rate);
         assert!(c.rx_center_hz - 10_489.49e6 < 0.45 * c.sample_rate);
         // DC and the transmit LO's leakage fall where nobody transmits.
         let (a, b) = RESERVED_HZ[1];
         assert!((a..b).contains(&c.rx_center_hz) && (a..b).contains(&downlink(c.tx_lo_hz)));
-        // The transmitter at half the rate still reaches the whole uplink.
+        // From the middle-beacon LO the transmitter reaches the whole uplink.
         assert_eq!(c.tx_rate(), 0.6e6);
         let reach = c.tx_rate() / 2.0 - TX_EDGE_HZ;
         assert!(UPLINK_HIGH_HZ - c.tx_lo_hz < reach && c.tx_lo_hz - UPLINK_LOW_HZ < reach);

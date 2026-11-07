@@ -17,7 +17,7 @@ use num_complex::Complex;
 /// Samples per receive transfer: about 40 ms of signal. Over the network every transfer
 /// is a round trip, so high rates need large buffers to keep up.
 fn buffer_samples(rate: f64) -> usize {
-    ((rate * 0.04) as usize).next_power_of_two().clamp(65_536, 1 << 20)
+    ((rate * 0.04) as usize).next_power_of_two().clamp(16_384, 1 << 20)
 }
 /// Samples per transmit transfer: about 10 ms. The device queues four of them, so short
 /// transfers keep the delay of the voice low.
@@ -31,24 +31,28 @@ const TX_FULL_SCALE: f32 = 32767.0;
 /// Below this sample rate the AD936x needs its FIR filters, decimating and interpolating
 /// by four (S/s).
 pub const FIR_RATE_LIMIT: f64 = 2_083_334.0;
-/// Transmit sample rate for a receive rate. At the low rates the transmitter runs at
-/// half the receiver's: a Pluto on Ethernet takes only about 5 MB/s, too little for the
-/// transmitter at the receiver's rate. Its converter then runs at half the receiver's
-/// clock, which the AD936x allows.
+/// Transmit sample rate for a receive rate: the same. The chip itself would allow the
+/// transmitter half the receiver's rate, but the Pluto's FPGA interface runs both at
+/// one rate (tried: the transmitter came out at the receive rate, an octave high).
 pub fn tx_rate_for(rate: f64) -> f64 {
-    if rate < FIR_RATE_LIMIT { rate / 2.0 } else { rate }
+    rate
 }
+
+/// Lowest ADC clock of the AD936x (Hz).
+const MIN_ADC_HZ: u64 = 25_000_000;
 
 /// Taps of the low-rate FIR filters.
 const FIR_TAPS: usize = 128;
 
-/// Clock chain for `rate` with the FIR filters by four and the three half-band stages by
-/// two: (BBPLL, ADC/DAC, HB3 out, HB2 out, FIR in, sample rate), as the filter file's
-/// RTX/RRX lines give it. The BBPLL must run at 715..1430 MHz, a power of two above
-/// the converter clock.
+/// Clock chain for `rate` with the FIR filters by four, the half-band stages HB1 and HB2
+/// by two and HB3 by two (or three, when the ADC would otherwise run below its 25 MHz
+/// minimum): (BBPLL, ADC/DAC, HB3 out, HB2 out, FIR in, sample rate), as the filter
+/// file's RTX/RRX lines give it. The BBPLL must run at 715..1430 MHz, a power of two
+/// above the converter clock.
 pub fn clock_chain(rate: f64) -> Option<[u64; 6]> {
     let r = rate.round() as u64;
-    let adc = r * 32;
+    let hb3 = if r * 32 >= MIN_ADC_HZ { 2 } else { 3 };
+    let adc = r * 16 * hb3;
     let pll = (1..=6).map(|k| adc << k).find(|p| (715_000_000..=1_430_000_000).contains(p))?;
     Some([pll, adc, r * 16, r * 8, r * 4, r])
 }
@@ -699,10 +703,9 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "RX 3 GAIN -6 DEC 4");
         assert_eq!(lines[1], "TX 3 GAIN 0 INT 4");
-        // The transmitter at half the rate, its converter at half the receiver's clock.
-        assert_eq!(lines[2], "RTX 1228800000 19200000 9600000 4800000 2400000 600000");
+        assert_eq!(lines[2], "RTX 1228800000 38400000 19200000 9600000 4800000 1200000");
         assert_eq!(lines[3], "RRX 1228800000 38400000 19200000 9600000 4800000 1200000");
-        assert_eq!(lines[4], "BWTX 540000");
+        assert_eq!(lines[4], "BWTX 1080000");
         assert_eq!(lines[5], "BWRX 1080000");
         let taps: Vec<(i32, i32)> = lines[6..]
             .iter()
@@ -724,7 +727,10 @@ mod tests {
         // ADI's LTE 1.4 MHz filter file: RTX 983040000 61440000 30720000 15360000 7680000 1920000
         // (HB3 by two there too); ours keeps the same steps.
         assert_eq!(clock_chain(1.92e6), Some([1_966_080_000 / 2, 61_440_000, 30_720_000, 15_360_000, 7_680_000, 1_920_000]));
-        assert_eq!(clock_chain(600e3).map(|c| c[0]), Some(1_228_800_000));
+        // 0.6 MS/s: HB3 by three keeps the ADC at 28.8 MHz (the Pluto's own default
+        // chain at 2.4 MS/s uses this clock too: BBPLL 921.6 MHz, ADC 28.8 MHz).
+        assert_eq!(clock_chain(600e3), Some([921_600_000, 28_800_000, 9_600_000, 4_800_000, 2_400_000, 600_000]));
+        assert_eq!(clock_chain(520_833.0).map(|c| c[1]), Some(24_999_984));
     }
 
     #[test]

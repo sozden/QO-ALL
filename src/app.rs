@@ -26,6 +26,10 @@ const ZOOMS: [Option<f64>; 3] = [None, Some(60e3), Some(12e3)];
 const WATERFALL_ROWS: usize = 300;
 /// FT8 and FT4 dial on QO-100 (downlink, Hz).
 const FT_DIAL_HZ: f64 = 10_489.540e6;
+/// Sample rate for radios on Ethernet: a Pluto there takes only about 5 MB/s, and the
+/// transmitter needs it at the receiver's rate. 0.6 MS/s still covers the transponder
+/// (±250 kHz around the middle beacon).
+const LOW_RATE: f64 = 0.6e6;
 /// Modes offered: SSB on QO-100 is USB only.
 const MODES: [Mode; 2] = [Mode::Usb, Mode::Cw];
 /// Largest transmit attenuation offered on the slider (dB).
@@ -133,7 +137,10 @@ impl App {
         };
         let defaults = StationConfig::default();
         // Ethernet links carry too little for 2.4 MS/s both ways: the low rate there.
-        let rate = s.get("sample_rate").unwrap_or(if matches!(device, DeviceChoice::Iio(ref u) if u.starts_with("ip:")) { 1.2e6 } else { 2.4e6 });
+        let rate = s.get("sample_rate").unwrap_or(if matches!(device, DeviceChoice::Iio(ref u) if u.starts_with("ip:")) { LOW_RATE } else { 2.4e6 });
+        // Any earlier low rate (1.2 MS/s was too much for an Ethernet link) becomes the
+        // one low rate offered now.
+        let rate = if rate < qo_all::iio::FIR_RATE_LIMIT { LOW_RATE } else { rate };
         let config = StationConfig {
             device,
             lnb_lo_hz: s.get("lnb_lo_hz").unwrap_or(defaults.lnb_lo_hz),
@@ -913,8 +920,8 @@ impl App {
             }
             ui.add_space(4.0);
             ui.label(self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)"));
-            let low = self.t("1.2 MS/s receive, 0.6 MS/s transmit · Ethernet", "1.2 MS/s alma, 0.6 MS/s gönderme · Ethernet");
-            ui.radio_value(&mut self.edit_rate, 1.2e6, low);
+            let low = self.t("0.6 MS/s · Ethernet (FIR filter in the radio)", "0.6 MS/s · Ethernet (cihazda FIR filtresi)");
+            ui.radio_value(&mut self.edit_rate, LOW_RATE, low);
             let high = self.t("2.4 MS/s · USB", "2.4 MS/s · USB");
             ui.radio_value(&mut self.edit_rate, 2.4e6, high);
             ui.add_space(8.0);
