@@ -77,6 +77,11 @@ pub struct App {
     rit: f64,
     xit_on: bool,
     xit: f64,
+    /// Whether the self check's measurements correct the uplink by themselves, the last
+    /// measurement, and the one already applied.
+    auto_uplink: bool,
+    last_measurement: Option<qo_all::selfcheck::Measurement>,
+    applied_measurement: u64,
 
     armed: bool,
     ptt_latched: bool,
@@ -176,6 +181,9 @@ impl App {
             rit: s.get("rit_hz").unwrap_or(0.0),
             xit_on: s.get("xit_on").unwrap_or(false),
             xit: s.get("xit_hz").unwrap_or(0.0),
+            auto_uplink: s.get("auto_uplink").unwrap_or(true),
+            last_measurement: None,
+            applied_measurement: 0,
             armed: false,
             ptt_latched: false,
             tune: false,
@@ -237,6 +245,8 @@ impl App {
         self.armed = false;
         self.ptt_latched = false;
         self.tune = false;
+        // The new station's measurements count from one again.
+        self.applied_measurement = 0;
         // Nothing of the previous radio stays on screen (a failed connection must not
         // look like a working one).
         self.line.clear();
@@ -313,6 +323,8 @@ impl App {
             tx.time_out = Duration::from_secs(self.time_out_s as u64);
         }
         e.ft8.set_dial(Some(to_if(FT_DIAL_HZ)));
+        // The own signal's carrier should come down on the transmit dial (plus XIT).
+        e.selfcheck.set_expected(Some(to_if(self.tx_signal())));
         e.ft4.set_dial(self.ft4_on.then(|| to_if(FT_DIAL_HZ)));
         let (lo, hi) = self.view_band();
         let view = View { offset_hz: to_if((lo + hi) / 2.0) - self.config.center_if(), span_hz: hi - lo };
@@ -328,6 +340,17 @@ impl App {
     fn poll(&mut self) {
         let Some(e) = &self.engine else { return };
         let events: Vec<Event> = e.events.try_iter().collect();
+        // A new measurement of the own signal: it came down this much off, so the uplink
+        // moves the other way. Small ones (within the measuring accuracy) are left.
+        if let Some(m) = e.selfcheck.latest()
+            && m.id != self.applied_measurement
+        {
+            self.applied_measurement = m.id;
+            self.last_measurement = Some(m);
+            if self.auto_uplink && m.estimate.offset_hz.abs() >= 3.0 {
+                self.tx_correction = (self.tx_correction - m.estimate.offset_hz).round();
+            }
+        }
         if let Some(c) = e.correction() {
             self.correction = c;
         }
@@ -406,6 +429,7 @@ impl App {
         s.set("rit_hz", self.rit);
         s.set("xit_on", self.xit_on);
         s.set("xit_hz", self.xit);
+        s.set("auto_uplink", self.auto_uplink);
         s.set("tx_attenuation_db", self.attenuation);
         s.set("mic_gain_db", self.mic_gain_db);
         s.set("compress", self.compress);
@@ -864,6 +888,15 @@ impl App {
                 );
                 ui.label(RichText::new(text).size(11.0).color(TX));
             }
+            let mode = if self.auto_uplink { self.t("auto", "oto") } else { self.t("manual", "elle") };
+            let mut line = format!("{} {:+.0} Hz · {mode}", self.t("Uplink corr.", "Uplink düz."), self.tx_correction);
+            if let Some(m) = self.last_measurement {
+                line += &format!("\n{} {:+.0} Hz", self.t("last measured", "son ölçüm"), m.estimate.offset_hz);
+            }
+            ui.label(RichText::new(line).size(11.0).color(MUTED)).on_hover_text(self.t(
+                "Your own signal is found on the downlink while you transmit (voice or tune tone) and the uplink is corrected by what it is off",
+                "Yayın yaparken kendi sinyaliniz downlink'te bulunur (ses ya da ton) ve uplink kayma kadar düzeltilir",
+            ));
             if let Some(e) = &status.error {
                 ui.label(RichText::new(e).size(11.0).color(TX));
             }
@@ -937,6 +970,11 @@ impl App {
             });
             ui.add_space(8.0);
             ui::caption(ui, self.t("TRANSMITTER", "VERİCİ"), TX);
+            let auto = self.t("Correct the uplink automatically", "Uplink'i otomatik düzelt");
+            ui.checkbox(&mut self.auto_uplink, auto).on_hover_text(self.t(
+                "Finds your own signal on the downlink while you transmit and moves the uplink so that it comes down on your dial (plus XIT)",
+                "Yayın yaparken kendi sinyalinizi downlink'te bulur ve uplink'i, sinyal dinleme frekansınıza (artı XIT) insin diye kaydırır",
+            ));
             ui.horizontal(|ui| {
                 ui.label(self.t("Uplink correction", "Uplink düzeltmesi"));
                 ui.add(egui::DragValue::new(&mut self.tx_correction).speed(10.0).suffix(" Hz"));

@@ -16,6 +16,7 @@ pub mod logo;
 pub mod listen;
 pub mod paths;
 pub mod radio;
+pub mod selfcheck;
 pub mod sim;
 pub mod source;
 pub mod tune;

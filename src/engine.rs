@@ -20,6 +20,7 @@ use crate::ft8::worker::Ft8;
 use crate::iio::{IioRadio, TX_ATTENUATION_MAX};
 use crate::listen::{ListenSettings, Listener};
 use crate::radio::{RxDevice, TxDevice};
+use crate::selfcheck::SelfCheck;
 use crate::sim::SimRx;
 use crate::source::{self, Block, Frame, View};
 use crate::tx::SsbModulator;
@@ -199,6 +200,8 @@ pub struct Engine {
     pub beacon: SharedBeacon,
     pub ft8: Ft8,
     pub ft4: Ft8,
+    /// Finds the own signal on the downlink (automatic uplink correction).
+    pub selfcheck: SelfCheck,
     pub tx: Arc<Mutex<TxSettings>>,
     pub tx_status: Arc<Mutex<TxStatus>>,
     /// Name of the open microphone and speaker, or why they could not be opened.
@@ -244,6 +247,8 @@ impl Engine {
         ft8.spawn(channel());
         let ft4 = Ft8::new(&crate::ft8::FT4);
         ft4.spawn(channel());
+        let selfcheck = SelfCheck::default();
+        selfcheck.spawn(channel());
         let spectrum_rx = channel();
         let view = Arc::new(Mutex::new(View::full(config.sample_rate)));
         {
@@ -281,6 +286,7 @@ impl Engine {
                 mic: mic.is_some().then_some(mic_rx),
                 mic_rate,
                 listener: listener.clone(),
+                selfcheck: selfcheck.clone(),
                 stop: stop.clone(),
                 tx_lo_hz: config.tx_lo_hz,
                 rate: config.tx_rate(),
@@ -314,6 +320,7 @@ impl Engine {
             beacon,
             ft8,
             ft4,
+            selfcheck,
             tx: tx_settings,
             tx_status,
             microphone,
@@ -413,6 +420,7 @@ struct TxLink {
     mic: Option<Receiver<Vec<f32>>>,
     mic_rate: f64,
     listener: Listener,
+    selfcheck: SelfCheck,
     stop: Arc<AtomicBool>,
     tx_lo_hz: f64,
     rate: f64,
@@ -523,6 +531,7 @@ fn transmit(link: TxLink) {
                 let audio: Vec<f32> = pending.drain(..).collect();
                 iq.clear();
                 m.process(&audio, 1.0, &mut iq);
+                link.selfcheck.push_tx(&m.baseband, link.mic_rate);
                 result = d.write(&iq);
                 sent.1 += iq.len();
             }
@@ -655,7 +664,8 @@ mod tests {
             tx.armed = true;
             tx.tune = true;
         }
-        let tone_if = dial + TUNE_HZ - lo - correction;
+        engine.selfcheck.set_expected(Some(dial - lo - correction));
+        let tone_if = dial + TUNE_HZ + crate::sim::TX_ERROR_HZ - lo - correction;
         *engine.view.lock().unwrap() = View { offset_hz: tone_if - engine.config.center_if(), span_hz: 12e3 };
         let started = Instant::now();
         let mut last = None;
@@ -675,5 +685,15 @@ mod tests {
         println!("peak {:.1} dB over the median at {:+.0} Hz from the expected place", peak.1 - median, at - tone_if);
         assert!(peak.1 - median > 20.0 && (at - tone_if).abs() < 60.0);
         assert_eq!(engine.tx_status.lock().unwrap().state, TxState::Transmit);
+
+        // End of the transmission: the self check measures the transmitter's error.
+        engine.tx.lock().unwrap().tune = false;
+        let started = Instant::now();
+        while engine.selfcheck.latest().is_none() && started.elapsed() < Duration::from_secs(5) {
+            let _ = engine.events.recv_timeout(Duration::from_millis(200));
+        }
+        let m = engine.selfcheck.latest().expect("a self-check measurement");
+        println!("self check {m:?}");
+        assert!((m.estimate.offset_hz - crate::sim::TX_ERROR_HZ).abs() < 10.0);
     }
 }

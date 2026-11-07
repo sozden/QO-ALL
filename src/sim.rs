@@ -15,6 +15,9 @@ use crate::radio::{RxDevice, TxDevice};
 
 /// Path delay up to the satellite and back (s).
 pub const ECHO_DELAY_S: f64 = 0.25;
+/// The simulated transmitter's own frequency error (Hz on the uplink), like the -930 Hz
+/// a real Pluto showed: what the automatic uplink correction has to find.
+pub const TX_ERROR_HZ: f64 = -900.0;
 /// Amplitude of one's own signal coming back at full power (the transmitter's peak
 /// is 0.5).
 const ECHO_GAIN: f32 = 0.12;
@@ -256,7 +259,7 @@ impl RxDevice for SimRx {
         }
         self.echo.extend(sent);
         let tx_lo = *self.shared.tx_lo_hz.lock().unwrap();
-        self.echo_mixer.set(if_of(tx_lo + TRANSLATION_HZ) - self.center_hz);
+        self.echo_mixer.set(if_of(tx_lo + TX_ERROR_HZ + TRANSLATION_HZ) - self.center_hz);
 
         for z in out.iter_mut() {
             let mut v = Complex::new(self.noise(), self.noise()) * NOISE;
@@ -415,7 +418,7 @@ mod tests {
             filled += rx.read(&mut got[filled..]).unwrap();
         }
         // Expected place, relative to the centre, after the LNB error.
-        let expected = 2_400.25e6 + offset + TRANSLATION_HZ - lo - lnb_error(0.0) - center;
+        let expected = 2_400.25e6 + offset + TX_ERROR_HZ + TRANSLATION_HZ - lo - lnb_error(0.0) - center;
         let power = |from: f64, to: f64| {
             let (a, b) = ((from * rate) as usize, (to * rate) as usize);
             let mut acc = Complex::<f64>::default();

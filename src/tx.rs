@@ -133,6 +133,9 @@ pub struct SsbModulator {
     pub alc_db: f32,
     /// Peak audio level after the microphone gain in the last call (dBFS).
     pub mic_peak_db: f32,
+    /// The SSB signal of the last call at the audio rate, carrier at zero (for finding
+    /// it again on the downlink).
+    pub baseband: Vec<Complex<f32>>,
     scratch: Vec<Complex<f32>>,
     scratch2: Vec<Complex<f32>>,
 }
@@ -166,6 +169,7 @@ impl SsbModulator {
             offset: Mixer::new(0.0, out_rate),
             alc_db: 0.0,
             mic_peak_db: -150.0,
+            baseband: Vec::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
         }
@@ -222,6 +226,8 @@ impl SsbModulator {
             }
         }
         self.alc_db = -20.0 * reduction.log10();
+        self.baseband.clear();
+        self.baseband.extend_from_slice(&b);
         a.clear();
         self.interpolator.process(&b, &mut a);
         let step = self.audio_rate * INTERPOLATION as f64 / self.out_rate * speed;
