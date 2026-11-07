@@ -10,5 +10,6 @@ pub mod dsp;
 pub mod freq;
 pub mod ft8;
 pub mod iio;
+pub mod logo;
 pub mod paths;
 pub mod source;

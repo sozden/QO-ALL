@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 140" width="600" height="280">
+  <title>QO-ALL</title>
+  <rect width="300" height="140" rx="16" fill="#0d1420"/>
+  <!-- Dish turned towards the satellite; uplink (red) leaves the feed, downlink (amber) arrives. -->
+  <g transform="rotate(30 60 90) translate(0 6)">
+    <path d="M20 70 Q60 120 100 70" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <line x1="60" y1="95" x2="60" y2="76" stroke="#ffffff" stroke-width="4"/>
+    <rect x="54" y="68" width="12" height="9" rx="2" fill="#ffffff"/>
+    <path d="M48 60 L48 14 M38 26 L48 13 L58 26" fill="none" stroke="#ff7a7a" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M72 13 L72 58 M62 46 L72 59 L82 46" fill="none" stroke="#f2b33d" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <line x1="56" y1="104" x2="56" y2="124" stroke="#8fa3bf" stroke-width="5"/>
+  <line x1="40" y1="126" x2="72" y2="126" stroke="#8fa3bf" stroke-width="5" stroke-linecap="round"/>
+  <text x="140" y="80" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="40" font-weight="500" fill="#ffffff">QO</text>
+  <text x="205" y="80" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="40" font-weight="500" fill="#f2b33d">ALL</text>
+  <text x="142" y="104" font-family="Consolas, Menlo, monospace" font-size="12" fill="#8fa3bf">2.4 GHz ↑  10 GHz ↓</text>
+</svg>
