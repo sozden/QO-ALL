@@ -30,6 +30,7 @@ struct Shared {
     /// Linear gain from the transmit attenuation.
     tx_gain: Mutex<f32>,
     powered: AtomicBool,
+    /// Transmit sample rate.
     rate: Mutex<f64>,
 }
 
@@ -106,6 +107,11 @@ pub struct SimRx {
     signals: Vec<Signal>,
     echo: VecDeque<Complex<f32>>,
     echo_mixer: Mixer,
+    /// Resampling of the transmitted samples to the receive rate: position between
+    /// the previous and the current sample.
+    echo_phase: f64,
+    echo_prev: Complex<f32>,
+    echo_cur: Complex<f32>,
     morse: Vec<bool>,
     /// One-pole smoothing of the PSK beacon's phase changes.
     psk_smoothing: f32,
@@ -159,6 +165,9 @@ impl SimRx {
             signals,
             echo: VecDeque::new(),
             echo_mixer: Mixer::new(0.0, 2.4e6),
+            echo_phase: 0.0,
+            echo_prev: Complex::default(),
+            echo_cur: Complex::default(),
             morse: morse_units(CALL),
             psk_smoothing: psk_smoothing(2.4e6),
         }
@@ -227,12 +236,21 @@ impl RxDevice for SimRx {
         }
         // One's own signal back from the satellite.
         let n = out.len();
-        let mut sent: Vec<Complex<f32>> = {
+        let ratio = *self.shared.rate.lock().unwrap() / self.rate;
+        let sent: Vec<Complex<f32>> = {
             let mut q = self.shared.queue.lock().unwrap();
-            let take = n.min(q.len());
-            q.drain(..take).collect()
+            (0..n)
+                .map(|_| {
+                    self.echo_phase += ratio;
+                    while self.echo_phase >= 1.0 {
+                        self.echo_phase -= 1.0;
+                        self.echo_prev = self.echo_cur;
+                        self.echo_cur = q.pop_front().unwrap_or_default();
+                    }
+                    self.echo_prev + (self.echo_cur - self.echo_prev) * self.echo_phase as f32
+                })
+                .collect()
         };
-        sent.resize(n, Complex::default());
         if self.echo.len() < (ECHO_DELAY_S * self.rate) as usize {
             self.echo.extend(std::iter::repeat_n(Complex::default(), (ECHO_DELAY_S * self.rate) as usize - self.echo.len()));
         }
@@ -276,7 +294,7 @@ impl RxDevice for SimRx {
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), String> {
         self.rate = rate;
-        *self.shared.rate.lock().unwrap() = rate;
+        *self.shared.rate.lock().unwrap() = crate::iio::tx_rate_for(rate);
         for s in &mut self.signals {
             s.mixers = (0..s.mixers.len()).map(|_| Mixer::new(0.0, rate)).collect();
         }
@@ -333,6 +351,10 @@ impl TxDevice for SimTx {
         Ok(())
     }
 
+    fn set_sample_rate(&mut self, rate: f64) {
+        *self.shared.rate.lock().unwrap() = rate;
+    }
+
     fn set_powered(&mut self, on: bool) -> Result<(), String> {
         self.shared.powered.store(on, Ordering::Relaxed);
         Ok(())
@@ -378,6 +400,7 @@ mod tests {
         let center = 10_489.75e6 - lo;
         rx.set_frequency(center).unwrap();
         let mut tx = rx.transmitter().unwrap();
+        tx.set_sample_rate(rate);
         // Transmit LO 2400.25 MHz, carrier 20 kHz below it → 10489.730 MHz down.
         tx.set_frequency(2_400.25e6).unwrap();
         tx.set_attenuation(0.0).unwrap();

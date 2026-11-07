@@ -27,6 +27,9 @@ pub trait TxDevice: Send {
     /// Output attenuation (dB, 0 = full power).
     fn set_attenuation(&mut self, db: f64) -> Result<(), String>;
     fn set_bandwidth(&mut self, hz: f64) -> Result<(), String>;
+    /// The rate the samples are written at. An AD936x takes it from the receiver's
+    /// set-up; the simulator needs to be told.
+    fn set_sample_rate(&mut self, _rate: f64) {}
     fn set_powered(&mut self, on: bool) -> Result<(), String>;
     /// Sends samples; blocks to pace the caller at the sample rate.
     fn write(&mut self, samples: &[Complex<f32>]) -> Result<(), String>;

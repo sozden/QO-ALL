@@ -847,7 +847,7 @@ impl App {
                 TxState::Blocked(_) => RX,
             };
             ui.label(RichText::new(state).size(12.0).color(color));
-            let rate = self.config.sample_rate;
+            let rate = self.config.tx_rate();
             if status.state == TxState::Transmit && status.sent_rate > 0.0 && status.sent_rate < rate * 0.9 {
                 let text = format!(
                     "{} {:.2}/{:.2} MS/s",
@@ -913,7 +913,7 @@ impl App {
             }
             ui.add_space(4.0);
             ui.label(self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)"));
-            let low = self.t("1.2 MS/s · Ethernet (FIR filter in the radio)", "1.2 MS/s · Ethernet (cihazda FIR filtresi)");
+            let low = self.t("1.2 MS/s receive, 0.6 MS/s transmit · Ethernet", "1.2 MS/s alma, 0.6 MS/s gönderme · Ethernet");
             ui.radio_value(&mut self.edit_rate, 1.2e6, low);
             let high = self.t("2.4 MS/s · USB", "2.4 MS/s · USB");
             ui.radio_value(&mut self.edit_rate, 2.4e6, high);

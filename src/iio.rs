@@ -31,6 +31,14 @@ const TX_FULL_SCALE: f32 = 32767.0;
 /// Below this sample rate the AD936x needs its FIR filters, decimating and interpolating
 /// by four (S/s).
 pub const FIR_RATE_LIMIT: f64 = 2_083_334.0;
+/// Transmit sample rate for a receive rate. At the low rates the transmitter runs at
+/// half the receiver's: a Pluto on Ethernet takes only about 5 MB/s, too little for the
+/// transmitter at the receiver's rate. Its converter then runs at half the receiver's
+/// clock, which the AD936x allows.
+pub fn tx_rate_for(rate: f64) -> f64 {
+    if rate < FIR_RATE_LIMIT { rate / 2.0 } else { rate }
+}
+
 /// Taps of the low-rate FIR filters.
 const FIR_TAPS: usize = 128;
 
@@ -70,11 +78,11 @@ pub fn low_rate_fir(rate: f64) -> String {
     let scale = |gain: f64| -> Vec<i32> { h.iter().map(|v| (v / sum * gain * 32_768.0).round() as i32).collect() };
     let (tx, rx) = (scale(4.0 * 0.9), scale(2.0 * 0.95));
     let mut out = String::from("RX 3 GAIN -6 DEC 4\nTX 3 GAIN 0 INT 4\n");
-    if let Some(chain) = clock_chain(rate) {
-        let line = chain.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-        out += &format!("RTX {line}\nRRX {line}\n");
-        let bw = (rate * 0.9).round() as u64;
-        out += &format!("BWTX {bw}\nBWRX {bw}\n");
+    let tx_rate = tx_rate_for(rate);
+    if let (Some(rx), Some(tx)) = (clock_chain(rate), clock_chain(tx_rate)) {
+        let line = |c: [u64; 6]| c.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+        out += &format!("RTX {}\nRRX {}\n", line(tx), line(rx));
+        out += &format!("BWTX {}\nBWRX {}\n", (tx_rate * 0.9).round() as u64, (rate * 0.9).round() as u64);
     }
     for (t, r) in tx.iter().zip(&rx) {
         out += &format!("{t},{r}\n");
@@ -314,6 +322,8 @@ pub struct IioRadio {
     /// made again when the sample rate changes (its size follows the rate).
     buffer: Ptr,
     rate: f64,
+    /// The transmitter's sample rate (half the receiver's at the low rates).
+    tx_rate: f64,
     pending: Vec<Complex<f32>>,
     position: usize,
 }
@@ -354,6 +364,7 @@ impl IioRadio {
             q,
             buffer: std::ptr::null_mut(),
             rate: 2.4e6,
+            tx_rate: 2.4e6,
             pending: Vec::new(),
             position: 0,
         })
@@ -443,6 +454,7 @@ impl IioRadio {
             self.buffer = std::ptr::null_mut();
         }
         self.rate = rate;
+        self.tx_rate = tx_rate_for(rate);
         Ok(())
     }
 
@@ -540,7 +552,7 @@ impl IioRadio {
             i,
             q,
             buffer: std::ptr::null_mut(),
-            buffer_len: tx_buffer_samples(self.rate),
+            buffer_len: tx_buffer_samples(self.tx_rate),
             filled: 0,
             powered: true,
         };
@@ -687,9 +699,11 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "RX 3 GAIN -6 DEC 4");
         assert_eq!(lines[1], "TX 3 GAIN 0 INT 4");
-        assert_eq!(lines[2], "RTX 1228800000 38400000 19200000 9600000 4800000 1200000");
+        // The transmitter at half the rate, its converter at half the receiver's clock.
+        assert_eq!(lines[2], "RTX 1228800000 19200000 9600000 4800000 2400000 600000");
         assert_eq!(lines[3], "RRX 1228800000 38400000 19200000 9600000 4800000 1200000");
-        assert_eq!(lines[4], "BWTX 1080000");
+        assert_eq!(lines[4], "BWTX 540000");
+        assert_eq!(lines[5], "BWRX 1080000");
         let taps: Vec<(i32, i32)> = lines[6..]
             .iter()
             .map(|l| {

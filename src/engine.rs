@@ -37,7 +37,7 @@ const TUNE_CHUNK_S: f64 = 0.02;
 /// reserve, so network jitter does not break up the voice.
 const TX_LEAD_S: f64 = 0.06;
 /// Room kept at the band edges for the transmit signal (Hz).
-const TX_EDGE_HZ: f64 = 50e3;
+const TX_EDGE_HZ: f64 = 40e3;
 
 /// Which radio to use.
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +99,11 @@ impl StationConfig {
             self.tx_lo_hz = d.tx_lo_hz;
         }
         self
+    }
+
+    /// The transmitter's sample rate.
+    pub fn tx_rate(&self) -> f64 {
+        crate::iio::tx_rate_for(self.sample_rate)
     }
 
     /// Receiver frequency the radio is tuned to (IF).
@@ -278,7 +283,7 @@ impl Engine {
                 listener: listener.clone(),
                 stop: stop.clone(),
                 tx_lo_hz: config.tx_lo_hz,
-                rate: config.sample_rate,
+                rate: config.tx_rate(),
                 notify: notify.clone(),
             };
             thread::Builder::new().name("transmit".into()).spawn(move || transmit(link)).expect("transmit thread");
@@ -442,6 +447,7 @@ fn transmit(link: TxLink) {
     };
     while !link.stop.load(Ordering::Relaxed) {
         if let Ok(mut d) = link.devices.try_recv() {
+            d.set_sample_rate(link.rate);
             let setup = d
                 .set_frequency(link.tx_lo_hz)
                 .and_then(|_| d.set_bandwidth(link.rate))
@@ -592,7 +598,9 @@ mod tests {
         // DC and the transmit LO's leakage fall where nobody transmits.
         let (a, b) = RESERVED_HZ[1];
         assert!((a..b).contains(&c.rx_center_hz) && (a..b).contains(&downlink(c.tx_lo_hz)));
-        let reach = c.sample_rate / 2.0 - TX_EDGE_HZ;
+        // The transmitter at half the rate still reaches the whole uplink.
+        assert_eq!(c.tx_rate(), 0.6e6);
+        let reach = c.tx_rate() / 2.0 - TX_EDGE_HZ;
         assert!(UPLINK_HIGH_HZ - c.tx_lo_hz < reach && c.tx_lo_hz - UPLINK_LOW_HZ < reach);
         assert_eq!(c.with_rate(2.4e6), StationConfig::default());
     }
@@ -657,7 +665,7 @@ mod tests {
             }
         }
         println!("tx status {:?}", engine.tx_status.lock().unwrap());
-        assert!(engine.tx_status.lock().unwrap().sent_rate > 0.95 * rate, "the radio is fed in real time");
+        assert!(engine.tx_status.lock().unwrap().sent_rate > 0.95 * engine.config.tx_rate(), "the radio is fed in real time");
         let f = last.expect("frame");
         let peak = f.db.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         let at = f.lo_hz + (peak.0 as f64 + 0.5) / f.db.len() as f64 * (f.hi_hz - f.lo_hz);
