@@ -443,6 +443,16 @@ impl IioTransmitter {
         self.buffer_len
     }
 
+    /// Drops the transfer buffer and whatever the device still has queued, so that the
+    /// next transmission starts with fresh audio.
+    pub fn stop(&mut self) {
+        if !self.buffer.is_null() {
+            unsafe { (self.shared.api.buffer_destroy)(self.buffer) };
+            self.buffer = std::ptr::null_mut();
+        }
+        self.filled = 0;
+    }
+
     /// Queues samples (full scale 1.0); every full buffer is sent. Blocks while the
     /// device's queue is full, which paces the caller at the sample rate.
     pub fn write(&mut self, mut samples: &[Complex<f32>]) -> Result<(), String> {

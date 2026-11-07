@@ -177,15 +177,31 @@ pub struct AudioInput {
     pub name: String,
 }
 
-/// Records from the first input device whose name contains `name_part` (e.g. a radio's
-/// USB sound device). Mono blocks (the first channel) go to `sink`; blocks that do not
-/// fit in it are dropped.
-pub fn open_input(name_part: &str, sink: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<AudioInput, String> {
+/// Recording devices (microphones) of the default sound system.
+pub fn input_devices() -> Vec<OutputDevice> {
     let host = cpal::default_host();
-    let devices = host.input_devices().map_err(|e| e.to_string())?;
-    let name_of = |d: &cpal::Device| d.description().map(|desc| desc.name().to_string()).unwrap_or_else(|_| d.to_string());
-    let device = devices.into_iter().find(|d| name_of(d).contains(name_part)).ok_or_else(|| format!("no sound input named “{name_part}”"))?;
-    let name = name_of(&device);
+    let Ok(devices) = host.input_devices() else { return Vec::new() };
+    devices
+        .filter_map(|d| {
+            let id = d.id().ok()?.to_string();
+            let name = d.description().map(|desc| desc.name().to_string()).unwrap_or_else(|_| d.to_string());
+            Some(OutputDevice { id, name })
+        })
+        .collect()
+}
+
+/// Records from `device_id` (or the system's default microphone). Mono blocks (the
+/// first channel) go to `sink`; blocks that do not fit in it are dropped.
+pub fn open_input(device_id: Option<&str>, sink: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<AudioInput, String> {
+    let host = cpal::default_host();
+    let device = match device_id {
+        Some(id) => {
+            let id: cpal::DeviceId = id.parse().map_err(|e| format!("{e:?}"))?;
+            host.device_by_id(&id).ok_or("the selected microphone is not available")?
+        }
+        None => host.default_input_device().ok_or("no microphone")?,
+    };
+    let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| device.to_string());
     let supported = device.default_input_config().map_err(|e| e.to_string())?;
     let config = supported.config();
     let stream = match supported.sample_format() {
