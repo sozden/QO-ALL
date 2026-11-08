@@ -20,17 +20,31 @@ use qo_all::ft8::{FT8, Protocol, encode};
 use crate::settings::Settings;
 use crate::ui::{self, palette::*};
 
-/// Row colours of the band activity.
-const TO_ME_BG: Color32 = Color32::from_rgb(0x5a, 0x1e, 0x24);
-const NEW_CQ_BG: Color32 = Color32::from_rgb(0x15, 0x3d, 0x28);
-const NEW_GRID_BG: Color32 = Color32::from_rgb(0x34, 0x24, 0x5c);
-const OWN: Color32 = RX;
-const WORKED: Color32 = Color32::from_rgb(0x6a, 0x7b, 0x93);
+/// Row colours of the band activity: dark rows with white text at night, light rows with
+/// dark text on paper.
+fn shade(night: [u8; 3], paper: [u8; 3]) -> Color32 {
+    let c = if light() { paper } else { night };
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+#[allow(non_snake_case)]
+fn TO_ME_BG() -> Color32 { shade([0x5a, 0x1e, 0x24], [0xf3, 0xcf, 0xc7]) }
+#[allow(non_snake_case)]
+fn NEW_CQ_BG() -> Color32 { shade([0x15, 0x3d, 0x28], [0xdc, 0xeb, 0xc9]) }
+#[allow(non_snake_case)]
+fn NEW_GRID_BG() -> Color32 { shade([0x34, 0x24, 0x5c], [0xe3, 0xd9, 0xf2]) }
+#[allow(non_snake_case)]
+fn WORKED() -> Color32 { shade([0x6a, 0x7b, 0x93], [0x9c, 0x8f, 0x78]) }
 /// Alert colours: a new DXCC entity, a new grid square.
-const NEW_DXCC_BG: Color32 = Color32::from_rgb(0x6b, 0x40, 0x0c);
-const NEW_SQUARE_BG: Color32 = Color32::from_rgb(0x0d, 0x4a, 0x52);
-const ALERT: Color32 = Color32::from_rgb(0xff, 0xb3, 0x4d);
-pub const ALERT_COLOR: Color32 = ALERT;
+#[allow(non_snake_case)]
+fn NEW_DXCC_BG() -> Color32 { shade([0x6b, 0x40, 0x0c], [0xf5, 0xd9, 0xa8]) }
+#[allow(non_snake_case)]
+fn NEW_SQUARE_BG() -> Color32 { shade([0x0d, 0x4a, 0x52], [0xcf, 0xe6, 0xe8]) }
+/// Text on the coloured rows.
+#[allow(non_snake_case)]
+fn ROW_TEXT() -> Color32 { STRONG() }
+pub fn alert_color() -> Color32 {
+    shade([0xff, 0xb3, 0x4d], [0xb0, 0x5a, 0x00])
+}
 /// How long an alert stays in the panel's title (s).
 const ALERT_SHOWN_S: f64 = 30.0;
 
@@ -257,7 +271,7 @@ impl FtPanel {
             let odd = ((slot as f64 / p.slot_s).round() as u64) % 2 == 1;
             for m in &messages {
                 if self.involves_me(&m.text) {
-                    let color = if matches!(parse(&m.text), Parsed::Directed { ref to, .. } if *to == self.seq.my_call) { TX } else { TEXT };
+                    let color = if matches!(parse(&m.text), Parsed::Directed { ref to, .. } if *to == self.seq.my_call) { TX() } else { TEXT() };
                     self.line(format!("{} {:+3.0} {:4.0}  {}", hms(m.slot), m.snr_db, m.audio_hz, m.text), color);
                 }
             }
@@ -310,7 +324,7 @@ impl FtPanel {
             self.acked = Some(id);
             if let Some(sc) = self.scheduled.take().filter(|s| s.id == id) {
                 self.last_tx_slot = Some(sc.slot);
-                self.line(format!("{} TX      {}", hms(sc.slot * p.slot_s as u64), sc.text), OWN);
+                self.line(format!("{} TX      {}", hms(sc.slot * p.slot_s as u64), sc.text), RX());
                 // Counts only if the sequence did not move on meanwhile.
                 if sc.step == self.seq.next {
                     self.seq.sent(now as u64);
@@ -345,7 +359,7 @@ impl FtPanel {
                     if let Some(entity) = self.cty.as_ref().and_then(|cty| cty.entity(&c.call)) {
                         self.worked_entities.insert(entity.name.clone());
                     }
-                    self.line(format!("LOG {} {} {} {}/{}", c.call, c.grid.clone().unwrap_or_default(), p.name, c.rst_sent, c.rst_rcvd), GOOD);
+                    self.line(format!("LOG {} {} {} {}/{}", c.call, c.grid.clone().unwrap_or_default(), p.name, c.rst_sent, c.rst_rcvd), GOOD());
                     self.status = format!("{} {}", t("Logged", "Loglandı:"), c.call);
                 }
                 Err(err) => self.status = format!("{}: {err}", t("Log not written", "Log yazılamadı")),
@@ -408,25 +422,25 @@ impl FtPanel {
     fn colors(&self, text: &str) -> (Option<Color32>, Color32) {
         let me = &self.seq.my_call;
         match parse(text) {
-            Parsed::Directed { to, .. } if !me.is_empty() && to == *me => (Some(TO_ME_BG), Color32::WHITE),
-            Parsed::Directed { from, .. } | Parsed::Cq { from, .. } if !me.is_empty() && from == *me => (None, OWN),
+            Parsed::Directed { to, .. } if !me.is_empty() && to == *me => (Some(TO_ME_BG()), ROW_TEXT()),
+            Parsed::Directed { from, .. } | Parsed::Cq { from, .. } if !me.is_empty() && from == *me => (None, RX()),
             Parsed::Cq { from, grid } if self.alerts.dxcc_show && self.novelty(&from, grid.as_deref()).0 => {
-                (Some(NEW_DXCC_BG), Color32::WHITE)
+                (Some(NEW_DXCC_BG()), ROW_TEXT())
             }
             Parsed::Cq { from, grid } if self.alerts.grid_show && self.novelty(&from, grid.as_deref()).1 => {
-                (Some(NEW_SQUARE_BG), Color32::WHITE)
+                (Some(NEW_SQUARE_BG()), ROW_TEXT())
             }
             Parsed::Cq { from, grid } => match self.worked.status(&from, grid.as_deref()) {
-                Status::New => (Some(NEW_CQ_BG), Color32::WHITE),
-                Status::NewGrid => (Some(NEW_GRID_BG), Color32::WHITE),
-                Status::Worked => (None, WORKED),
+                Status::New => (Some(NEW_CQ_BG()), ROW_TEXT()),
+                Status::NewGrid => (Some(NEW_GRID_BG()), ROW_TEXT()),
+                Status::Worked => (None, WORKED()),
             },
             Parsed::Directed { from, payload: Payload::Grid(g), .. } => match self.worked.status(&from, Some(&g)) {
-                Status::Worked => (None, WORKED),
+                Status::Worked => (None, WORKED()),
                 Status::NewGrid => (None, Color32::from_rgb(0xb4, 0x9c, 0xff)),
-                Status::New => (None, TEXT),
+                Status::New => (None, TEXT()),
             },
-            _ => (None, TEXT),
+            _ => (None, TEXT()),
         }
     }
 
@@ -435,22 +449,22 @@ impl FtPanel {
         let t = |en: &'static str, tr_: &'static str| if tr { tr_ } else { en };
         // The legend follows the title, and goes on to the next line when narrow.
         ui.horizontal_wrapped(|ui| {
-            ui::caption(ui, format!("{} · {}", p.name, t("BAND ACTIVITY", "BANT ETKİNLİĞİ")), BLUE);
+            ui::caption(ui, format!("{} · {}", p.name, t("BAND ACTIVITY", "BANT ETKİNLİĞİ")), BLUE());
             ui.add_space(8.0);
-            ui::pill(ui, t("new", "yeni"), Color32::WHITE, NEW_CQ_BG);
-            ui::pill(ui, t("new locator", "yeni lokatör"), Color32::WHITE, NEW_GRID_BG);
-            ui::pill(ui, t("worked", "çalışılmış"), WORKED, RAISED);
-            ui::pill(ui, t("to me", "bana"), Color32::WHITE, TO_ME_BG);
+            ui::pill(ui, t("new", "yeni"), ROW_TEXT(), NEW_CQ_BG());
+            ui::pill(ui, t("new locator", "yeni lokatör"), ROW_TEXT(), NEW_GRID_BG());
+            ui::pill(ui, t("worked", "çalışılmış"), WORKED(), RAISED());
+            ui::pill(ui, t("to me", "bana"), ROW_TEXT(), TO_ME_BG());
             if self.alerts.dxcc_show && self.cty.is_some() {
-                ui::pill(ui, t("new DXCC", "yeni DXCC"), Color32::WHITE, NEW_DXCC_BG);
+                ui::pill(ui, t("new DXCC", "yeni DXCC"), ROW_TEXT(), NEW_DXCC_BG());
             }
             if self.alerts.grid_show {
-                ui::pill(ui, t("new square", "yeni kare"), Color32::WHITE, NEW_SQUARE_BG);
+                ui::pill(ui, t("new square", "yeni kare"), ROW_TEXT(), NEW_SQUARE_BG());
             }
             if let Some((text, at)) = &self.banner
                 && now_utc() - at < ALERT_SHOWN_S
             {
-                ui.label(RichText::new(format!("★ {text}")).size(13.0).strong().color(ALERT));
+                ui.label(RichText::new(format!("★ {text}")).size(13.0).strong().color(alert_color()));
             }
         });
         let worker = if std::ptr::eq(p, &FT8) { &e.ft8 } else { &e.ft4 };
@@ -463,7 +477,7 @@ impl FtPanel {
             for m in shown {
                 if last_slot.is_some_and(|s| s != m.slot) {
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
-                    ui.painter().line_segment([r.left_center(), r.right_center()], egui::Stroke::new(1.0, BORDER));
+                    ui.painter().line_segment([r.left_center(), r.right_center()], egui::Stroke::new(1.0, BORDER()));
                 }
                 last_slot = Some(m.slot);
                 let (bg, fg) = self.colors(&m.text);
@@ -504,7 +518,7 @@ impl FtPanel {
 
     /// The contact's messages and what was sent.
     pub fn qso_pane(&mut self, ui: &mut egui::Ui, tr: bool) {
-        ui::caption(ui, if tr { "QSO" } else { "QSO" }, RX);
+        ui::caption(ui, if tr { "QSO" } else { "QSO" }, RX());
         egui::ScrollArea::vertical().id_salt("qso_lines").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for (l, c) in &self.qso_lines {
@@ -518,21 +532,21 @@ impl FtPanel {
         let t = |en: &'static str, tr_: &'static str| if tr { tr_ } else { en };
         let dx = self.seq.dx.clone();
         ui.horizontal(|ui| {
-            ui::caption(ui, "DX", TX);
+            ui::caption(ui, "DX", TX());
             match &dx {
                 Some(d) => {
-                    ui.label(RichText::new(format!("{} {}", d.call, d.grid.clone().unwrap_or_default())).monospace().size(14.0).color(Color32::WHITE));
+                    ui.label(RichText::new(format!("{} {}", d.call, d.grid.clone().unwrap_or_default())).monospace().size(14.0).color(STRONG()));
                     let rcvd = d.rcvd.map_or("—".to_string(), format_report);
                     let sent = d.sent.map_or("—".to_string(), format_report);
-                    ui.label(RichText::new(format!("{} {sent} · {} {rcvd}", t("sent", "gön."), t("rcvd", "alı."))).size(11.0).color(MUTED));
+                    ui.label(RichText::new(format!("{} {sent} · {} {rcvd}", t("sent", "gön."), t("rcvd", "alı."))).size(11.0).color(MUTED()));
                 }
                 None => {
-                    ui.label(RichText::new(t("— (CQ or double click a station)", "— (CQ ya da istasyona çift tık)")).size(11.0).color(DIM));
+                    ui.label(RichText::new(t("— (CQ or double click a station)", "— (CQ ya da istasyona çift tık)")).size(11.0).color(DIM()));
                 }
             }
         });
         ui.horizontal(|ui| {
-            if ui::choice(ui, "CQ", self.seq.next == Step::Tx6 && !self.seq.done, BLUE) {
+            if ui::choice(ui, "CQ", self.seq.next == Step::Tx6 && !self.seq.done, BLUE()) {
                 if self.seq.my_call.is_empty() {
                     self.status = t("Enter your call sign in the settings first", "Önce Ayarlar'dan çağrı işaretinizi girin").into();
                 } else {
@@ -542,13 +556,13 @@ impl FtPanel {
                 }
             }
             let (label, on) = if self.enabled { (t("Tx enabled", "Tx açık"), true) } else { (t("Enable Tx", "Tx'i aç"), false) };
-            if ui::choice(ui, label, on, TX) {
+            if ui::choice(ui, label, on, TX()) {
                 self.enabled = !self.enabled;
                 if self.enabled {
                     self.seq.done = false;
                 }
             }
-            if ui::choice(ui, t("Halt", "Durdur"), false, TX) {
+            if ui::choice(ui, t("Halt", "Durdur"), false, TX()) {
                 self.halt(e);
             }
         });
@@ -556,7 +570,7 @@ impl FtPanel {
             ui.checkbox(&mut self.auto_seq, t("Auto seq", "Oto sıra"));
             ui.checkbox(&mut self.cq_odd, t("CQ in 2nd slot", "CQ 2. dilimde"))
                 .on_hover_text(t("Odd slots (WSJT-X: Tx even/1st off)", "Tek dilimler (WSJT-X: Tx even/1st kapalı)"));
-            ui.label(RichText::new("Tx").size(11.0).color(MUTED));
+            ui.label(RichText::new("Tx").size(11.0).color(MUTED()));
             let max = 2_700.0 - signal_width(p);
             ui.add(egui::DragValue::new(&mut self.audio_hz).speed(5.0).range(300.0..=max).suffix(" Hz"));
         });
@@ -568,7 +582,7 @@ impl FtPanel {
             // Without a partner only the CQ makes sense.
             let usable = step == Step::Tx6 || self.seq.dx.is_some();
             let label = format!("{:?}  {text}", step);
-            let color = if active { Color32::WHITE } else if usable { MUTED } else { DIM };
+            let color = if active { STRONG() } else if usable { MUTED() } else { DIM() };
             let r = ui.add_enabled(usable, egui::Button::selectable(active, RichText::new(label).monospace().size(12.0).color(color)));
             if r.clicked() {
                 chosen = Some(step);
@@ -592,7 +606,7 @@ impl FtPanel {
             _ => String::new(),
         };
         let st = if self.status.is_empty() { state } else if state.is_empty() { self.status.clone() } else { format!("{state} · {}", self.status) };
-        ui.label(RichText::new(st).size(11.0).color(RX));
+        ui.label(RichText::new(st).size(11.0).color(RX()));
         let _ = e;
     }
 }

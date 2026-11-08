@@ -142,8 +142,10 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
-        ui::apply_theme(&cc.egui_ctx);
         let s = Settings::load();
+        // Night (dark) or paper (light) theme.
+        ui::palette::set_light(s.text("theme").as_deref() == Some("paper"));
+        ui::apply_theme(&cc.egui_ctx);
         let lang = match s.text("lang").as_deref() {
             Some("en") => Lang::En,
             Some("tr") => Lang::Tr,
@@ -222,7 +224,7 @@ impl App {
             line: Vec::new(),
             line_band: FULL_VIEW,
             floor: -100.0,
-            waterfall: ColorImage::new([FRAME_POINTS, WATERFALL_ROWS], vec![DEEP; FRAME_POINTS * WATERFALL_ROWS]),
+            waterfall: ColorImage::new([FRAME_POINTS, WATERFALL_ROWS], vec![DEEP(); FRAME_POINTS * WATERFALL_ROWS]),
             waterfall_tex: None,
             logo,
             tab: DecoderTab::Ft8,
@@ -291,7 +293,7 @@ impl App {
         // Nothing of the previous radio stays on screen (a failed connection must not
         // look like a working one).
         self.line.clear();
-        self.waterfall.pixels.fill(DEEP);
+        self.waterfall.pixels.fill(DEEP());
         if let Some(tex) = &mut self.waterfall_tex {
             tex.set(self.waterfall.clone(), TextureOptions::LINEAR);
         }
@@ -300,6 +302,19 @@ impl App {
         let engine = Engine::start(self.config.clone(), listen, TxSettings::default(), self.volume, move || ctx.request_repaint());
         self.engine = Some(engine);
         self.sync();
+    }
+
+    /// Switches between the night and the paper theme; the waterfall starts over in the
+    /// new colours.
+    fn set_theme(&mut self, ctx: &egui::Context, paper: bool) {
+        ui::palette::set_light(paper);
+        ui::apply_theme(ctx);
+        self.waterfall.pixels.fill(DEEP());
+        if let Some(tex) = &mut self.waterfall_tex {
+            tex.set(self.waterfall.clone(), TextureOptions::LINEAR);
+        }
+        self.settings.set("theme", if paper { "paper" } else { "night" });
+        self.save();
     }
 
     /// The volume the speaker plays at.
@@ -538,7 +553,7 @@ impl App {
         if let Some(span) = ZOOMS[self.zoom] {
             if (self.rx_dial - self.zoom_center).abs() > span * 0.4 {
                 self.zoom_center = self.rx_dial;
-                self.waterfall.pixels.fill(DEEP);
+                self.waterfall.pixels.fill(DEEP());
             }
         }
     }
@@ -548,60 +563,62 @@ impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.image((self.logo.id(), vec2(30.0, 30.0)));
-            ui.label(RichText::new("QO").size(19.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new("QO").size(19.0).strong().color(STRONG()));
             ui.add_space(-4.0);
-            ui.label(RichText::new("ALL").size(19.0).strong().color(RX));
+            ui.label(RichText::new("ALL").size(19.0).strong().color(RX()));
             ui.add_space(10.0);
             match (&self.error, &self.model) {
                 (Some(e), _) => {
-                    ui::pill(ui, e.clone(), TX, Color32::from_rgb(0x3a, 0x14, 0x18));
+                    ui::pill(ui, e.clone(), TX(), TX_BG());
                 }
                 (None, Some(m)) => {
                     let duplex = match &self.tx_capable {
                         Some(Ok(())) => self.t("full duplex", "full duplex"),
                         _ => self.t("receive only", "yalnızca alıcı"),
                     };
-                    ui::pill(ui, format!("{m} · {duplex}"), BLUE, RAISED);
+                    ui::pill(ui, format!("{m} · {duplex}"), BLUE(), RAISED());
                 }
                 (None, None) => {
-                    ui::pill(ui, self.t("Connecting…", "Bağlanıyor…"), MUTED, RAISED);
+                    ui::pill(ui, self.t("Connecting…", "Bağlanıyor…"), MUTED(), RAISED());
                 }
             }
             let beacon = self.engine.as_ref().map(|e| *e.beacon.lock().unwrap());
             let (text, fg, bg) = match beacon.map(|b| b.status) {
                 Some(BeaconStatus::Locked { .. }) => (
                     format!("{} · LNB {:+.0} Hz", self.t("Beacon locked", "Beacon kilitli"), self.correction),
-                    GOOD,
-                    Color32::from_rgb(0x12, 0x30, 0x1f),
+                    GOOD(),
+                    GOOD_BG(),
                 ),
-                Some(BeaconStatus::NotFound) => (self.t("Beacon not found", "Beacon bulunamadı").to_string(), TX, RAISED),
-                Some(BeaconStatus::OutsideBand) => (self.t("Beacon outside the band", "Beacon bant dışında").to_string(), TX, RAISED),
-                _ => (self.t("Looking for the beacon…", "Beacon aranıyor…").to_string(), MUTED, RAISED),
+                Some(BeaconStatus::NotFound) => (self.t("Beacon not found", "Beacon bulunamadı").to_string(), TX(), RAISED()),
+                Some(BeaconStatus::OutsideBand) => (self.t("Beacon outside the band", "Beacon bant dışında").to_string(), TX(), RAISED()),
+                _ => (self.t("Looking for the beacon…", "Beacon aranıyor…").to_string(), MUTED(), RAISED()),
             };
             ui::pill(ui, text, fg, bg);
             if let Some(w) = &self.warning {
-                ui::pill(ui, w.clone(), RX, RAISED);
+                ui::pill(ui, w.clone(), RX(), RAISED());
             }
             if self.rate > 0.0 && self.rate < self.config.sample_rate * 0.95 {
-                ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), TX, RAISED)
+                ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), TX(), RAISED())
                     .on_hover_text(self.t("The radio delivers fewer samples than set", "Cihaz ayarlanandan az örnek gönderiyor"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new(self.t("Settings", "Ayarlar")).color(TEXT))).clicked() {
+                if ui.add(egui::Button::new(RichText::new(self.t("Settings", "Ayarlar")).color(TEXT()))).clicked() {
                     self.show_settings = !self.show_settings;
                     if self.show_settings {
                         self.mics = qo_all::audio::input_devices();
                         self.speakers = qo_all::audio::output_devices();
                     }
                 }
-                let next = if self.lang == Lang::Tr { "EN" } else { "TR" };
-                if ui.button(next).clicked() {
-                    self.lang = if self.lang == Lang::Tr { Lang::En } else { Lang::Tr };
-                    self.save();
+                // Language: both shown, the one in use marked.
+                for (lang, code) in [(Lang::En, "EN"), (Lang::Tr, "TR")] {
+                    if ui::choice(ui, code, self.lang == lang, BLUE()) && self.lang != lang {
+                        self.lang = lang;
+                        self.save();
+                    }
                 }
                 ui.add_space(10.0);
                 // Speaker volume and mute, in every mode (right to left here).
-                if ui::choice(ui, self.t("Mute", "Sessiz"), self.muted, TX) {
+                if ui::choice(ui, self.t("Mute", "Sessiz"), self.muted, TX()) {
                     self.muted = !self.muted;
                 }
                 let mut percent = (self.volume * 100.0).round();
@@ -612,10 +629,10 @@ impl App {
                     self.muted = false;
                 }
                 let level = if self.muted { self.t("off", "kapalı").to_string() } else { format!("{percent:.0}%") };
-                ui.label(RichText::new(format!("{} {level}", self.t("Volume", "Ses"))).size(12.0).color(MUTED));
+                ui.label(RichText::new(format!("{} {level}", self.t("Volume", "Ses"))).size(12.0).color(MUTED()));
                 ui.add_space(10.0);
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                ui.label(RichText::new(format!("{} UTC", clock(now))).monospace().size(14.0).color(MUTED));
+                ui.label(RichText::new(format!("{} UTC", clock(now))).monospace().size(14.0).color(MUTED()));
             });
         });
     }
@@ -633,15 +650,15 @@ impl App {
             let column = egui::Layout::top_down(egui::Align::Min);
             let rx_change = ui
                 .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
-                    ui::card(ui, DEEP, |ui| {
+                    ui::card(ui, DEEP(), |ui| {
                         ui.set_width(ui.available_width());
-                        ui::caption(ui, format!("DOWNLINK · RX · {} · {:.0} dBFS", self.mode.name(), level), RX);
-                        let change = ui::vfo(ui, self.rx_dial, 34.0, RX);
+                        ui::caption(ui, format!("DOWNLINK · RX · {} · {:.0} dBFS", self.mode.name(), level), RX());
+                        let change = ui::vfo(ui, self.rx_dial, 34.0, RX());
                         // Under it, as under the transmit side: the band plan's part, and
                         // the RIT when on.
                         let rit = if self.rit_on { format!(" · RIT {:+.0} Hz", self.rit) } else { String::new() };
                         let line = format!("{}{rit}", bandplan::segment(self.rx_listen()).to_uppercase());
-                        ui.label(RichText::new(line).monospace().size(13.0).color(RX.gamma_multiply(0.75)));
+                        ui.label(RichText::new(line).monospace().size(13.0).color(RX().gamma_multiply(0.75)));
                         change
                     })
                 })
@@ -661,7 +678,7 @@ impl App {
             }
             // Transmitter.
             let shift = self.tx_downlink() - self.rx_dial;
-            let fill = if transmitting { Color32::from_rgb(0x3a, 0x14, 0x18) } else { DEEP };
+            let fill = if transmitting { TX_BG() } else { DEEP() };
             // The big number is where the transmission comes down (10 GHz: in split the
             // place among the others), the uplink actually sent (2.4 GHz, corrections
             // included) under it.
@@ -672,9 +689,9 @@ impl App {
                     ui::card(ui, fill, |ui| {
                         ui.set_width(ui.available_width());
                         let shift = if self.linked { String::new() } else { format!(" · shift {:+.2} kHz", shift / 1e3) };
-                        ui::caption(ui, format!("TX · USB{shift}"), TX);
-                        let change = ui::vfo(ui, down, 34.0, TX);
-                        ui.label(RichText::new(format!("UPLINK {:.5} MHz", uplink / 1e6)).monospace().size(13.0).color(TX.gamma_multiply(0.75)));
+                        ui::caption(ui, format!("TX · USB{shift}"), TX());
+                        let change = ui::vfo(ui, down, 34.0, TX());
+                        ui.label(RichText::new(format!("UPLINK {:.5} MHz", uplink / 1e6)).monospace().size(13.0).color(TX().gamma_multiply(0.75)));
                         change
                     })
                 })
@@ -689,31 +706,31 @@ impl App {
         });
         ui.horizontal(|ui| {
             for m in MODES {
-                if ui::choice(ui, m.name(), self.mode == m && self.digital.is_none(), RX) {
+                if ui::choice(ui, m.name(), self.mode == m && self.digital.is_none(), RX()) {
                     self.set_digital(None);
                     self.mode = m;
                 }
             }
             for p in [&FT8, &FT4] {
                 let on = self.digital.is_some_and(|d| std::ptr::eq(d, p));
-                if ui::choice(ui, p.name, on, RX) && !on {
+                if ui::choice(ui, p.name, on, RX()) && !on {
                     self.set_digital(Some(p));
                 }
             }
             ui.add_space(12.0);
             let lock = if self.auto_lock { self.t("Lock: automatic", "Kilit: otomatik") } else { self.t("Lock: manual", "Kilit: elle") };
-            if ui::choice(ui, lock, self.auto_lock, BLUE) {
+            if ui::choice(ui, lock, self.auto_lock, BLUE()) {
                 self.auto_lock = !self.auto_lock;
             }
             ui.add_space(12.0);
-            offset_control(ui, "RIT", &mut self.rit_on, &mut self.rit, RX);
-            offset_control(ui, "XIT", &mut self.xit_on, &mut self.xit, TX);
+            offset_control(ui, "RIT", &mut self.rit_on, &mut self.rit, RX());
+            offset_control(ui, "XIT", &mut self.xit_on, &mut self.xit, TX());
             ui.add_space(12.0);
             for (i, label) in ["520 kHz", "60 kHz", "12 kHz"].iter().enumerate() {
-                if ui::choice(ui, label, self.zoom == i, BLUE) {
+                if ui::choice(ui, label, self.zoom == i, BLUE()) {
                     self.zoom = i;
                     self.zoom_center = self.rx_dial;
-                    self.waterfall.pixels.fill(DEEP);
+                    self.waterfall.pixels.fill(DEEP());
                     self.line.clear();
                 }
             }
@@ -724,7 +741,7 @@ impl App {
                         "Tık: dinle · Sağ tık: burada yayın · Tekerlek: 10 Hz (Shift 100 Hz)",
                     ))
                     .size(11.0)
-                    .color(DIM),
+                    .color(DIM()),
                 );
             });
         });
@@ -740,7 +757,7 @@ impl App {
             .get_or_insert_with(|| ui.ctx().load_texture("waterfall", self.waterfall.clone(), TextureOptions::LINEAR))
             .clone();
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(8), DEEP);
+        painter.rect_filled(rect, CornerRadius::same(8), DEEP());
         let spec = Rect::from_min_size(rect.min, vec2(rect.width(), (rect.height() * 0.36).max(80.0)));
         let axis_h = 18.0;
         let wf = Rect::from_min_max(pos2(rect.left(), spec.bottom() + axis_h), rect.max);
@@ -755,19 +772,19 @@ impl App {
         for (a, b) in bandplan::RESERVED_HZ {
             let r = Rect::from_min_max(pos2(x_of(a).max(rect.left()), spec.top()), pos2(x_of(b).min(rect.right()), spec.bottom()));
             if r.width() > 0.0 {
-                painter.rect_filled(r, CornerRadius::ZERO, TX.gamma_multiply(0.08));
+                painter.rect_filled(r, CornerRadius::ZERO, TX().gamma_multiply(0.08));
             }
         }
         // Frequency grid and axis.
         let step = ui::nice_step(width_hz / (rect.width() as f64 / 110.0));
         let axis = Rect::from_min_max(pos2(rect.left(), spec.bottom()), pos2(rect.right(), wf.top()));
-        painter.rect_filled(axis, CornerRadius::ZERO, BG);
+        painter.rect_filled(axis, CornerRadius::ZERO, BG());
         let mut f = (lo_hz / step).ceil() * step;
         while f <= hi_hz {
             let x = x_of(f);
-            painter.line_segment([pos2(x, spec.top()), pos2(x, spec.bottom())], Stroke::new(1.0, GRID));
+            painter.line_segment([pos2(x, spec.top()), pos2(x, spec.bottom())], Stroke::new(1.0, GRID()));
             let label = if step >= 1e3 { format!("{:.3}", f / 1e6) } else { format!("{:.4}", f / 1e6) };
-            painter.text(pos2(x, axis.center().y), Align2::CENTER_CENTER, label, FontId::monospace(11.0), DIM);
+            painter.text(pos2(x, axis.center().y), Align2::CENTER_CENTER, label, FontId::monospace(11.0), DIM());
             f += step;
         }
         // Spectrum line, filled below.
@@ -778,7 +795,7 @@ impl App {
             let points: Vec<egui::Pos2> =
                 self.line.iter().enumerate().map(|(i, &v)| pos2(rect.left() + (i as f32 + 0.5) / n as f32 * rect.width(), y_of(v))).collect();
             let mut mesh = egui::Mesh::default();
-            let fill = BLUE.gamma_multiply(0.14);
+            let fill = BLUE().gamma_multiply(0.14);
             for p in &points {
                 mesh.colored_vertex(*p, fill);
                 mesh.colored_vertex(pos2(p.x, spec.bottom()), fill);
@@ -789,41 +806,41 @@ impl App {
                 mesh.add_triangle(k + 1, k + 3, k + 2);
             }
             painter.add(egui::Shape::mesh(mesh));
-            painter.add(egui::Shape::line(points, Stroke::new(1.2, BLUE)));
+            painter.add(egui::Shape::line(points, Stroke::new(1.2, BLUE())));
         }
         // FT8 segment marker.
         let ft = x_of(FT_DIAL_HZ);
         if (rect.left()..rect.right()).contains(&ft) {
-            painter.text(pos2(ft + 3.0, spec.top() + 4.0), Align2::LEFT_TOP, "FT8", FontId::proportional(11.0), DIM);
+            painter.text(pos2(ft + 3.0, spec.top() + 4.0), Align2::LEFT_TOP, "FT8", FontId::proportional(11.0), DIM());
         }
         // Receiver passband and dial.
         let (pa, pb) = self.mode.passband(self.mode.default_bandwidth());
         let listen = self.rx_listen();
         let rx_band = Rect::from_min_max(pos2(x_of(listen + pa), rect.top()), pos2(x_of(listen + pb), rect.bottom()));
         let rx_band = if rx_band.width() < 3.0 { rx_band.expand2(vec2((3.0 - rx_band.width()) / 2.0, 0.0)) } else { rx_band };
-        painter.rect_filled(rx_band, CornerRadius::ZERO, RX.gamma_multiply(0.2));
+        painter.rect_filled(rx_band, CornerRadius::ZERO, RX().gamma_multiply(0.2));
         let rx_x = x_of(listen);
-        painter.line_segment([pos2(rx_x, rect.top()), pos2(rx_x, rect.bottom())], Stroke::new(1.5, RX));
-        painter.text(pos2(rx_x + 5.0, rect.top() + 3.0), Align2::LEFT_TOP, "RX", FontId::proportional(12.0), RX);
+        painter.line_segment([pos2(rx_x, rect.top()), pos2(rx_x, rect.bottom())], Stroke::new(1.5, RX()));
+        painter.text(pos2(rx_x + 5.0, rect.top() + 3.0), Align2::LEFT_TOP, "RX", FontId::proportional(12.0), RX());
         // Transmitter dial.
         if let Some(p) = self.digital {
             // FT8/FT4: the tones' place.
             let a = self.tx_signal() + self.ft.audio_hz;
             let r = Rect::from_min_max(pos2(x_of(a), rect.top()), pos2(x_of(a + FtPanel::signal_width(p)).max(x_of(a) + 2.0), rect.bottom()));
-            painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.5, TX), egui::StrokeKind::Middle);
-            painter.text(pos2(r.left() - 4.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
+            painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.5, TX()), egui::StrokeKind::Middle);
+            painter.text(pos2(r.left() - 4.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX());
         } else {
             let tx_x = x_of(self.tx_signal());
-            ui::dashed_vline(&painter, tx_x, rect.top(), rect.bottom(), Stroke::new(1.5, TX));
-            painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX);
+            ui::dashed_vline(&painter, tx_x, rect.top(), rect.bottom(), Stroke::new(1.5, TX()));
+            painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX());
         }
 
         // Hover readout.
         if let Some(p) = response.hover_pos() {
             let hz = hz_of(p.x);
-            painter.line_segment([pos2(p.x, spec.top()), pos2(p.x, spec.bottom())], Stroke::new(1.0, MUTED.gamma_multiply(0.5)));
+            painter.line_segment([pos2(p.x, spec.top()), pos2(p.x, spec.bottom())], Stroke::new(1.0, MUTED().gamma_multiply(0.5)));
             let text = format!("{:.3} MHz · {}", hz / 1e6, bandplan::segment(hz));
-            painter.text(pos2(p.x + 8.0, spec.bottom() - 6.0), Align2::LEFT_BOTTOM, text, FontId::monospace(11.0), TEXT);
+            painter.text(pos2(p.x + 8.0, spec.bottom() - 6.0), Align2::LEFT_BOTTOM, text, FontId::monospace(11.0), TEXT());
             let (steps, shift) = ui::wheel_steps(ui);
             if steps != 0 {
                 self.tune_rx(self.rx_dial + steps as f64 * if shift { 100.0 } else { 10.0 });
@@ -862,7 +879,7 @@ impl App {
     fn decoders(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tab, name) in [(DecoderTab::Ft8, "FT8"), (DecoderTab::Ft4, "FT4"), (DecoderTab::Cw, "CW")] {
-                if ui::choice(ui, name, self.tab == tab, BLUE) {
+                if ui::choice(ui, name, self.tab == tab, BLUE()) {
                     self.tab = tab;
                 }
             }
@@ -875,7 +892,7 @@ impl App {
                     DecoderTab::Cw => format!("{} · {:.3}", self.t("dial", "dinlenen"), self.rx_dial / 1e6),
                     _ => format!("{:.3}", FT_DIAL_HZ / 1e6),
                 };
-                ui.label(RichText::new(text).size(11.0).color(DIM));
+                ui.label(RichText::new(text).size(11.0).color(DIM()));
             });
         });
         let Some(e) = &self.engine else { return };
@@ -909,7 +926,7 @@ impl App {
         };
         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             for l in lines {
-                ui.label(RichText::new(l).monospace().size(12.0).color(TEXT));
+                ui.label(RichText::new(l).monospace().size(12.0).color(TEXT()));
             }
         });
     }
@@ -917,10 +934,10 @@ impl App {
     fn sound(&mut self, ui: &mut egui::Ui) {
         let status = self.engine.as_ref().map(|e| e.tx_status.lock().unwrap().clone()).unwrap_or_default();
         ui.horizontal(|ui| {
-            ui::caption(ui, self.t("SOUND AND VOX", "SES VE VOX"), TX);
+            ui::caption(ui, self.t("SOUND AND VOX", "SES VE VOX"), TX());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, on) = if self.vox.enabled { (self.t("VOX on", "VOX açık"), true) } else { (self.t("VOX off", "VOX kapalı"), false) };
-                if ui::choice(ui, text, on, GOOD) {
+                if ui::choice(ui, text, on, GOOD()) {
                     self.vox.enabled = !self.vox.enabled;
                 }
             });
@@ -931,8 +948,8 @@ impl App {
             Some(Err(e)) => format!("{}: {e}", self.t("No microphone", "Mikrofon yok")),
             None => String::new(),
         };
-        ui.label(RichText::new(mic_text).size(11.0).color(if matches!(mic, Some(Err(_))) { TX } else { MUTED }));
-        let bar_color = if status.vox_keyed { TX } else { GOOD };
+        ui.label(RichText::new(mic_text).size(11.0).color(if matches!(mic, Some(Err(_))) { TX() } else { MUTED() }));
+        let bar_color = if status.vox_keyed { TX() } else { GOOD() };
         ui::level_bar(ui, ui.available_width(), status.mic_db, (-70.0, 0.0), bar_color, Some(self.vox.threshold_db));
         egui::Grid::new("vox").num_columns(2).spacing(vec2(10.0, 3.0)).show(ui, |ui| {
             ui.label(RichText::new(self.t("Threshold", "Eşik")).size(12.0));
@@ -972,7 +989,7 @@ impl App {
         let can = matches!(self.tx_capable, Some(Ok(())));
         ui.vertical_centered(|ui| {
             let (arm_text, arm_color) =
-                if self.armed { (self.t("TX enabled", "TX etkin"), TX) } else { (self.t("TX disabled", "TX kapalı"), MUTED) };
+                if self.armed { (self.t("TX enabled", "TX etkin"), TX()) } else { (self.t("TX disabled", "TX kapalı"), MUTED()) };
             if ui::choice(ui, arm_text, self.armed, arm_color) && can {
                 self.armed = !self.armed;
                 if !self.armed {
@@ -981,7 +998,7 @@ impl App {
                 }
             }
             ui.add_space(2.0);
-            ui.label(RichText::new(self.t("Output power", "Çıkış gücü")).size(11.0).color(MUTED));
+            ui.label(RichText::new(self.t("Output power", "Çıkış gücü")).size(11.0).color(MUTED()));
             let mut power = -self.attenuation;
             ui.spacing_mut().slider_width = 70.0;
             ui.add(egui::Slider::new(&mut power, -MAX_ATTENUATION..=0.0).suffix(" dB").step_by(0.5));
@@ -989,7 +1006,7 @@ impl App {
             if self.digital.is_some() || self.mode == Mode::Cw {
                 // The level of the digital/CW audio: the power through the sound, as
                 // WSJT-X's Pwr slider.
-                ui.label(RichText::new("Drive").size(11.0).color(MUTED));
+                ui.label(RichText::new("Drive").size(11.0).color(MUTED()));
                 let mut d = (self.drive * 100.0).round();
                 ui.add(egui::Slider::new(&mut d, 5.0..=100.0).suffix(" %").step_by(1.0).fixed_decimals(0));
                 self.drive = d / 100.0;
@@ -1000,7 +1017,7 @@ impl App {
             // tune tone.
             if self.digital.is_none() && self.mode != Mode::Cw {
                 let tune_text = self.t("Tune 1 kHz", "Ton 1 kHz");
-                if ui::choice(ui, tune_text, self.tune, TX) && can && self.armed {
+                if ui::choice(ui, tune_text, self.tune, TX()) && can && self.armed {
                     self.tune = !self.tune;
                 }
                 if ui::ptt_button(ui, self.ptt_latched || on, can && self.armed) && can && self.armed {
@@ -1008,7 +1025,7 @@ impl App {
                 }
             } else {
                 let text = if on { "TX" } else { "RX" };
-                let color = if on { TX } else { DIM };
+                let color = if on { TX() } else { DIM() };
                 ui.label(RichText::new(text).size(28.0).strong().color(color));
             }
             let state = match status.state {
@@ -1026,9 +1043,9 @@ impl App {
                 TxState::Blocked(b) => self.blocked_text(b).to_string(),
             };
             let color = match status.state {
-                TxState::Transmit => TX,
-                TxState::Receive => GOOD,
-                TxState::Blocked(_) => RX,
+                TxState::Transmit => TX(),
+                TxState::Receive => GOOD(),
+                TxState::Blocked(_) => RX(),
             };
             ui.label(RichText::new(state).size(12.0).color(color));
             let rate = self.config.tx_rate();
@@ -1039,19 +1056,19 @@ impl App {
                     status.sent_rate / 1e6,
                     rate / 1e6
                 );
-                ui.label(RichText::new(text).size(11.0).color(TX));
+                ui.label(RichText::new(text).size(11.0).color(TX()));
             }
             let mode = if self.auto_uplink { self.t("auto", "oto") } else { self.t("manual", "elle") };
             let mut line = format!("{} {:+.0} Hz · {mode}", self.t("Uplink corr.", "Uplink düz."), self.tx_correction);
             if let Some(m) = self.last_measurement {
                 line += &format!("\n{} {:+.0} Hz", self.t("last measured", "son ölçüm"), m.estimate.offset_hz);
             }
-            ui.label(RichText::new(line).size(11.0).color(MUTED)).on_hover_text(self.t(
+            ui.label(RichText::new(line).size(11.0).color(MUTED())).on_hover_text(self.t(
                 "Your own signal is found on the downlink while you transmit (voice or tune tone) and the uplink is corrected by what it is off",
                 "Yayın yaparken kendi sinyaliniz downlink'te bulunur (ses ya da ton) ve uplink kayma kadar düzeltilir",
             ));
             if let Some(e) = &status.error {
-                ui.label(RichText::new(e).size(11.0).color(TX));
+                ui.label(RichText::new(e).size(11.0).color(TX()));
             }
         });
     }
@@ -1062,13 +1079,13 @@ impl App {
         let keyer = e.keyer.clone();
         let call = self.ft.seq.my_call.clone();
         ui.horizontal(|ui| {
-            ui::caption(ui, self.t("CW SENDING", "CW GÖNDERME"), TX);
+            ui::caption(ui, self.t("CW SENDING", "CW GÖNDERME"), TX());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(egui::Slider::new(&mut self.cw_wpm, 8.0..=40.0).suffix(" WPM").step_by(1.0).fixed_decimals(0));
             });
         });
         if !self.armed {
-            ui.label(RichText::new(self.t("Switch TX on (right) to send", "Göndermek için sağdaki TX'i açın")).size(11.0).color(RX));
+            ui.label(RichText::new(self.t("Switch TX on (right) to send", "Göndermek için sağdaki TX'i açın")).size(11.0).color(RX()));
         }
         // Text: Enter sends it.
         let hint = self.t("Text to send, Enter", "Gönderilecek metin, Enter");
@@ -1076,11 +1093,11 @@ impl App {
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let mut send: Option<String> = None;
         ui.horizontal_wrapped(|ui| {
-            if ui::choice(ui, self.t("Send", "Gönder"), false, TX) || enter {
+            if ui::choice(ui, self.t("Send", "Gönder"), false, TX()) || enter {
                 send = Some(self.cw_text.clone());
                 self.cw_text.clear();
             }
-            if ui::choice(ui, self.t("Stop", "Durdur"), false, TX) {
+            if ui::choice(ui, self.t("Stop", "Durdur"), false, TX()) {
                 keyer.lock().unwrap().stop();
             }
             let me = if call.is_empty() { "DE".to_string() } else { call.clone() };
@@ -1090,7 +1107,7 @@ impl App {
                 ("599", "UR 599 5NN BK".to_string()),
                 ("73", format!("TU 73 DE {me} <SK>")),
             ] {
-                if ui::choice(ui, label, false, BLUE) {
+                if ui::choice(ui, label, false, BLUE()) {
                     send = Some(text);
                 }
             }
@@ -1103,7 +1120,7 @@ impl App {
         let left = keyer.lock().unwrap().text_left();
         if left > 0 {
             let secs = left as f64 * 1.2 / self.cw_wpm;
-            ui.label(RichText::new(format!("{} · {secs:.0} s", self.t("Sending", "Gönderiliyor"))).size(11.0).color(TX));
+            ui.label(RichText::new(format!("{} · {secs:.0} s", self.t("Sending", "Gönderiliyor"))).size(11.0).color(TX()));
         }
         ui.add_space(4.0);
         // The keys: held with the mouse (or [ ] and Space on the keyboard).
@@ -1124,7 +1141,7 @@ impl App {
             k.dit = armed && (dit || (k_dit && !typing));
             k.dah = armed && (dah || (k_dah && !typing));
         });
-        ui.label(RichText::new(self.t("Keyboard: Space = key, [ = dit, ] = dah", "Klavye: Boşluk = anahtar, [ = dit, ] = dah")).size(11.0).color(DIM));
+        ui.label(RichText::new(self.t("Keyboard: Space = key, [ = dit, ] = dah", "Klavye: Boşluk = anahtar, [ = dit, ] = dah")).size(11.0).color(DIM()));
     }
 
     /// FT8/FT4: band activity, the contact, the controls and the transmitter.
@@ -1139,7 +1156,7 @@ impl App {
             let (activity, qso, controls) = (third, third, third);
             let column = egui::Layout::top_down(egui::Align::Min);
             ui.allocate_ui_with_layout(vec2(activity, h), column, |ui| {
-                ui::card(ui, DEEP, |ui| {
+                ui::card(ui, DEEP(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                     if let Some(e) = self.engine.as_ref() {
                         self.ft.activity(ui, e, p, tr);
@@ -1147,19 +1164,19 @@ impl App {
                 });
             });
             ui.allocate_ui_with_layout(vec2(qso, h), column, |ui| {
-                ui::card(ui, DEEP, |ui| {
+                ui::card(ui, DEEP(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                     self.ft.qso_pane(ui, tr);
                 });
             });
             ui.allocate_ui_with_layout(vec2(controls, h), column, |ui| {
-                ui::card(ui, CARD, |ui| {
+                ui::card(ui, CARD(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                     self.ft.controls(ui, self.engine.as_ref(), p, armed, tr);
                 });
             });
             ui.allocate_ui_with_layout(vec2(tx, h), column, |ui| {
-                ui::card(ui, CARD, |ui| {
+                ui::card(ui, CARD(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                     self.transmit(ui);
                 });
@@ -1183,7 +1200,20 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading(self.t("Settings", "Ayarlar"));
             ui.add_space(6.0);
-            ui::caption(ui, self.t("RADIO", "CİHAZ"), RX);
+            // Theme: applied at once.
+            ui.horizontal(|ui| {
+                ui.label(self.t("Theme", "Tema"));
+                let light = ui::palette::light();
+                let (night, paper) = (self.t("Night", "Gece"), self.t("Paper", "Kâğıt"));
+                if ui.radio(!light, night).clicked() && light {
+                    self.set_theme(ui.ctx(), false);
+                }
+                if ui.radio(light, paper).clicked() && !light {
+                    self.set_theme(ui.ctx(), true);
+                }
+            });
+            ui.add_space(6.0);
+            ui::caption(ui, self.t("RADIO", "CİHAZ"), RX());
             let label = self.t("Simulator (no radio)", "Simülatör (cihazsız)");
             ui.radio_value(&mut self.edit_device_iio, false, label);
             ui.radio_value(&mut self.edit_device_iio, true, "ADALM-Pluto / AD936x (libiio)");
@@ -1202,15 +1232,15 @@ impl App {
                     if !uri.is_empty() && ui.button(format!("{uri} · {description}")).clicked() {
                         self.edit_uri = uri;
                     } else if uri.is_empty() {
-                        ui.label(RichText::new(description).size(11.0).color(MUTED));
+                        ui.label(RichText::new(description).size(11.0).color(MUTED()));
                     }
                 }
                 ui.label(
-                    RichText::new(self.t("Network: ip:192.168.2.1 · USB: usb:1.2.5", "Ağ: ip:192.168.2.1 · USB: usb:1.2.5")).size(11.0).color(DIM),
+                    RichText::new(self.t("Network: ip:192.168.2.1 · USB: usb:1.2.5", "Ağ: ip:192.168.2.1 · USB: usb:1.2.5")).size(11.0).color(DIM()),
                 );
             });
             if let Err(e) = iio::library_status() {
-                ui.label(RichText::new(format!("libiio: {e}")).size(11.0).color(TX));
+                ui.label(RichText::new(format!("libiio: {e}")).size(11.0).color(TX()));
             }
             ui.add_space(4.0);
             ui.label(self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)"));
@@ -1219,7 +1249,7 @@ impl App {
             let high = self.t("2.4 MS/s · USB", "2.4 MS/s · USB");
             ui.radio_value(&mut self.edit_rate, 2.4e6, high);
             ui.add_space(8.0);
-            ui::caption(ui, self.t("RECEIVER", "ALICI"), RX);
+            ui::caption(ui, self.t("RECEIVER", "ALICI"), RX());
             ui.horizontal(|ui| {
                 ui.label(self.t("LNB LO", "LNB LO"));
                 ui.add(egui::DragValue::new(&mut self.edit_lnb_mhz).speed(0.001).suffix(" MHz").max_decimals(3));
@@ -1230,7 +1260,7 @@ impl App {
                 ui.add_enabled(!self.edit_auto_gain, egui::Slider::new(&mut self.edit_gain, 0.0..=70.0).suffix(" dB").step_by(1.0));
             });
             ui.add_space(8.0);
-            ui::caption(ui, self.t("TRANSMITTER", "VERİCİ"), TX);
+            ui::caption(ui, self.t("TRANSMITTER", "VERİCİ"), TX());
             let auto = self.t("Correct the uplink automatically", "Uplink'i otomatik düzelt");
             ui.checkbox(&mut self.auto_uplink, auto).on_hover_text(self.t(
                 "Finds your own signal on the downlink while you transmit and moves the uplink so that it comes down on your dial (plus XIT)",
@@ -1250,7 +1280,7 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.time_out_s, 30..=600).suffix(" s").step_by(10.0));
             });
             ui.add_space(8.0);
-            ui::caption(ui, self.t("STATION AND LOG (FT8/FT4)", "İSTASYON VE LOG (FT8/FT4)"), BLUE);
+            ui::caption(ui, self.t("STATION AND LOG (FT8/FT4)", "İSTASYON VE LOG (FT8/FT4)"), BLUE());
             egui::Grid::new("station").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
                 ui.label(self.t("Call sign", "Çağrı işareti"));
                 ui.add(egui::TextEdit::singleline(&mut self.edit_call).desired_width(120.0).char_limit(11));
@@ -1271,13 +1301,13 @@ impl App {
                     self.edit_log = w.display().to_string();
                 }
             });
-            ui.label(RichText::new(format!("{} {}", self.ft.worked.len(), self.t("stations in the log", "istasyon logda"))).size(11.0).color(DIM));
+            ui.label(RichText::new(format!("{} {}", self.ft.worked.len(), self.t("stations in the log", "istasyon logda"))).size(11.0).color(DIM()));
             ui.add_space(8.0);
-            ui::caption(ui, self.t("ALERTS (FT8/FT4)", "UYARILAR (FT8/FT4)"), ftpanel::ALERT_COLOR);
+            ui::caption(ui, self.t("ALERTS (FT8/FT4)", "UYARILAR (FT8/FT4)"), ftpanel::alert_color());
             egui::Grid::new("alerts").num_columns(3).spacing(vec2(10.0, 3.0)).show(ui, |ui| {
                 ui.label("");
-                ui.label(RichText::new(self.t("show", "göster")).size(11.0).color(MUTED));
-                ui.label(RichText::new(self.t("sound", "ses")).size(11.0).color(MUTED));
+                ui.label(RichText::new(self.t("show", "göster")).size(11.0).color(MUTED()));
+                ui.label(RichText::new(self.t("sound", "ses")).size(11.0).color(MUTED()));
                 ui.end_row();
                 ui.label(self.t("New DXCC", "Yeni DXCC"));
                 ui.checkbox(&mut self.ft.alerts.dxcc_show, "");
@@ -1296,9 +1326,9 @@ impl App {
                 Some(p) if known > 0 => format!("{known} {} · {worked} {} · {}", self.t("entities", "ülke"), self.t("worked", "çalışılmış"), p.display()),
                 _ => self.t("Not found: install WSJT-X or give the file", "Bulunamadı: WSJT-X kurun ya da dosyayı girin").to_string(),
             };
-            ui.label(RichText::new(cty_state).size(11.0).color(DIM));
+            ui.label(RichText::new(cty_state).size(11.0).color(DIM()));
             ui.add_space(8.0);
-            ui::caption(ui, self.t("SOUND", "SES"), GOOD);
+            ui::caption(ui, self.t("SOUND", "SES"), GOOD());
             let default = self.t("System default", "Sistem varsayılanı");
             let name_of = |list: &[qo_all::audio::OutputDevice], id: &Option<String>| {
                 id.as_ref().and_then(|id| list.iter().find(|d| &d.id == id)).map_or(default.to_string(), |d| d.name.clone())
@@ -1321,7 +1351,7 @@ impl App {
                     }
                 });
             ui.add_space(12.0);
-            if ui.add(egui::Button::new(RichText::new(self.t("Apply and restart", "Uygula ve yeniden başlat")).color(BG)).fill(RX)).clicked() {
+            if ui.add(egui::Button::new(RichText::new(self.t("Apply and restart", "Uygula ve yeniden başlat")).color(BG())).fill(RX())).clicked() {
                 self.edit_uri = iio::normalize_uri(&self.edit_uri);
                 self.config.device = if self.edit_device_iio { DeviceChoice::Iio(self.edit_uri.clone()) } else { DeviceChoice::Simulator };
                 self.config.lnb_lo_hz = self.edit_lnb_mhz * 1e6;
@@ -1337,7 +1367,7 @@ impl App {
                 self.show_settings = false;
             }
             ui.add_space(8.0);
-            ui.label(RichText::new(format!("QO-ALL {} · GPL-3.0-or-later", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM));
+            ui.label(RichText::new(format!("QO-ALL {} · GPL-3.0-or-later", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM()));
         });
     }
 }
@@ -1393,21 +1423,21 @@ impl eframe::App for App {
         }
         ui.ctx().request_repaint_after(Duration::from_millis(200));
 
-        let bar = egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6));
+        let bar = egui::Frame::new().fill(CARD()).inner_margin(egui::Margin::symmetric(14, 6));
         egui::Panel::top("header").frame(bar).show(ui, |ui| self.header(ui));
-        egui::Panel::top("vfos").frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.vfos(ui));
+        egui::Panel::top("vfos").frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.vfos(ui));
         if self.show_settings {
             egui::Panel::right("settings")
                 .resizable(false)
                 .default_size(330.0)
-                .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::same(14)))
+                .frame(egui::Frame::new().fill(CARD()).inner_margin(egui::Margin::same(14)))
                 .show(ui, |ui| self.settings_panel(ui));
         }
         egui::Panel::bottom("cards")
             .resizable(true)
             .default_size(230.0)
             .size_range(170.0..=420.0)
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 let h = ui.available_height();
                 if let Some(p) = self.digital {
@@ -1422,13 +1452,13 @@ impl eframe::App for App {
                     // Every card stacks its contents top-down, whatever the row's layout.
                     let column = egui::Layout::top_down(egui::Align::Min);
                     ui.allocate_ui_with_layout(vec2(decoders, h), column, |ui| {
-                        ui::card(ui, DEEP, |ui| {
+                        ui::card(ui, DEEP(), |ui| {
                             ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                             self.decoders(ui);
                         });
                     });
                     ui.allocate_ui_with_layout(vec2(side, h), column, |ui| {
-                        ui::card(ui, CARD, |ui| {
+                        ui::card(ui, CARD(), |ui| {
                             ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                             if self.mode == Mode::Cw {
                                 self.cw_card(ui);
@@ -1438,14 +1468,14 @@ impl eframe::App for App {
                         });
                     });
                     ui.allocate_ui_with_layout(vec2(ptt, h), column, |ui| {
-                        ui::card(ui, CARD, |ui| {
+                        ui::card(ui, CARD(), |ui| {
                             ui.set_min_size(vec2(ui.available_width(), h - 18.0));
                             self.transmit(ui);
                         });
                     });
                 });
             });
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 0))).show(ui, |ui| self.spectrum(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin::symmetric(12, 0))).show(ui, |ui| self.spectrum(ui));
     }
 
     fn on_exit(&mut self) {
