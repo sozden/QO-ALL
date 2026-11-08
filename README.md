@@ -1,16 +1,25 @@
+<p align="center"><img src="assets/qo-all-logo.svg" alt="QO-ALL" width="360"></p>
+
 # QO-ALL
 
-Full-duplex SSB and FT8/FT4 transceiver for the narrow-band transponder of the QO-100
+Full-duplex SSB, CW and FT8/FT4 transceiver for the narrow-band transponder of the QO-100
 (Es'hail-2) geostationary satellite. Listen on 10 GHz and transmit on 2.4 GHz at the same
 time with one ADALM-Pluto (or a similar AD936x radio over Ethernet or USB).
 
-**Status: test versions (0.3).** SSB with PTT and VOX, the beacon lock and the automatic
-uplink correction are in use with a Pluto on Ethernet. FT8/FT4 transmitting is new and
-has been tried on the built-in simulator.
+**Status: first public version (0.4.0).** SSB, FT8, the beacon lock and the automatic
+uplink correction are in use on the air with a Pluto on Ethernet; CW sending is new.
+Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
+[changelog](CHANGELOG.md) for what is in it and the known issues.
+
+![Night theme, FT8](docs/screenshot-night.webp)
+
+![Paper theme, SSB](docs/screenshot-paper.webp)
 
 ## Trying it
 
-Windows: unpack `QO-ALL-<version>-windows-x64.zip` and run `qo-all.exe`. It starts on
+Windows: download `QO-ALL-<version>-windows-x64.zip` from the
+[releases](https://github.com/sozden/QO-ALL/releases), unpack it and run `qo-all.exe`
+(libiio and its libraries are in the package). It starts on
 the **simulator** (no radio needed): the transponder with beacons and some users, a
 drifting LNB, and your own transmission coming back a quarter second later. Choose the
 radio under Settings (e.g. `192.168.2.1`). `qo-all.exe --diagnose 192.168.2.1` prints
@@ -66,9 +75,11 @@ QO-100 (Es'hail-2) uydusunun dar bant transponderi için full duplex SSB ve FT8/
 alıcı-verici. Tek bir ADALM-Pluto (veya Ethernet/USB ile bağlı benzer AD936x cihaz) ile
 10 GHz'de dinlerken aynı anda 2.4 GHz'de yayın yapılır.
 
-**Durum: deneme sürümleri (0.3).** PTT ve VOX'lu SSB, beacon kilidi ve otomatik uplink
-düzeltmesi Ethernet'li Pluto ile kullanılıyor. FT8/FT4 gönderimi yeni; yerleşik
-simülatörde denendi.
+**Durum: ilk herkese açık sürüm (0.4.0).** SSB, FT8, beacon kilidi ve otomatik uplink
+düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows paketi
+[sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında; açıp `qo-all.exe`'yi
+çalıştırmak yeterli. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)
+bölümüne yazabilirsiniz; ayrıntılar [değişiklikler](CHANGELOG.md) dosyasında.
 
 Program simülatörle açılır; cihaz Ayarlar'dan seçilir (ör. `192.168.2.1`). Yayın
 "TX etkin" açılmadan yapılmaz ve yalnızca dar bant uplink içinde, beacon'lar dışında olur.
