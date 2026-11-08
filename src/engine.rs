@@ -37,6 +37,9 @@ const TUNE_CHUNK_S: f64 = 0.02;
 /// Silence sent ahead of a transmission (s): the radio's queue then holds this much in
 /// reserve, so network jitter does not break up the voice.
 const TX_LEAD_S: f64 = 0.06;
+/// The transmitter stays on this long after the CW key was last busy, so it does not
+/// switch between the elements.
+const CW_HANG: Duration = Duration::from_millis(800);
 /// Room kept at the band edges for the transmit signal (Hz).
 const TX_EDGE_HZ: f64 = 40e3;
 
@@ -145,6 +148,11 @@ pub struct TxSettings {
     pub tune: bool,
     /// FT8/FT4: the transmitter sends the scheduled digital jobs, not the microphone.
     pub digital: bool,
+    /// CW: the keyer keys the transmitter.
+    pub cw: bool,
+    /// Level of the digital and CW audio (0..1): the output power through the sound
+    /// level, as WSJT-X's "Pwr" does.
+    pub drive: f32,
     /// Band plan check of the signal's place.
     pub band: Result<(), Refusal>,
     pub time_out: Duration,
@@ -163,6 +171,8 @@ impl Default for TxSettings {
             ptt: false,
             tune: false,
             digital: false,
+            cw: false,
+            drive: 1.0,
             band: Ok(()),
             time_out: crate::vox::DEFAULT_TIME_OUT,
         }
@@ -235,6 +245,8 @@ pub struct Engine {
     pub selfcheck: SelfCheck,
     /// FT8/FT4 transmissions to send, and the rate their audio is made at.
     pub digital: Arc<Mutex<DigitalState>>,
+    /// CW keyer (text, straight key, paddles).
+    pub keyer: Arc<Mutex<crate::keyer::Keyer>>,
     pub mic_rate: f64,
     pub tx: Arc<Mutex<TxSettings>>,
     pub tx_status: Arc<Mutex<TxStatus>>,
@@ -310,6 +322,7 @@ impl Engine {
         };
         let mic_rate = mic.as_ref().map_or(48_000.0, |m| m.sample_rate as f64);
         let digital = Arc::new(Mutex::new(DigitalState::default()));
+        let keyer = Arc::new(Mutex::new(crate::keyer::Keyer::new(mic_rate, 20.0)));
         let tx_settings = Arc::new(Mutex::new(tx));
         let tx_status = Arc::new(Mutex::new(TxStatus::default()));
         let (handoff_tx, handoff_rx) = mpsc::sync_channel::<Box<dyn TxDevice>>(1);
@@ -323,6 +336,7 @@ impl Engine {
                 listener: listener.clone(),
                 selfcheck: selfcheck.clone(),
                 digital: digital.clone(),
+                keyer: keyer.clone(),
                 stop: stop.clone(),
                 tx_lo_hz: config.tx_lo_hz,
                 rate: config.tx_rate(),
@@ -358,6 +372,7 @@ impl Engine {
             ft4,
             selfcheck,
             digital,
+            keyer,
             mic_rate,
             tx: tx_settings,
             tx_status,
@@ -460,6 +475,7 @@ struct TxLink {
     listener: Listener,
     selfcheck: SelfCheck,
     digital: Arc<Mutex<DigitalState>>,
+    keyer: Arc<Mutex<crate::keyer::Keyer>>,
     stop: Arc<AtomicBool>,
     tx_lo_hz: f64,
     rate: f64,
@@ -489,6 +505,9 @@ fn transmit(link: TxLink) {
     let mut feed: Option<(u64, Arc<Vec<f32>>, usize)> = None;
     let mut digital_started = None;
     let mut digital_missed = None;
+    // The last time the CW key was busy (the transmitter stays on a little after).
+    let mut cw_last: Option<Instant> = None;
+    let mut cw_audio = Vec::new();
     // Samples sent in the current second, and the rate of the last one.
     let mut sent = (Instant::now(), 0usize);
     let mut sent_rate = 0.0;
@@ -515,7 +534,8 @@ fn transmit(link: TxLink) {
         // for in short steps, so it starts on time.
         let tuning = on && link.settings.lock().unwrap().tune;
         let soon = link.digital.lock().unwrap().job.as_ref().is_some_and(|j| j.start_utc - now_utc() < 0.05);
-        let wait = if tuning || (on && feed.is_some()) {
+        let keying = on && link.settings.lock().unwrap().cw && link.keyer.lock().unwrap().busy();
+        let wait = if tuning || keying || (on && feed.is_some()) {
             Duration::ZERO
         } else if soon {
             Duration::from_millis(2)
@@ -545,7 +565,9 @@ fn transmit(link: TxLink) {
             delay.process(chunk, &mut delayed);
             pending.extend(&delayed);
         }
-        let offset = s.uplink_hz - link.tx_lo_hz;
+        // CW: the tone sits TONE_HZ above the modulator's carrier, which goes that much
+        // below the dial, so the CW carrier lands on the dial.
+        let offset = s.uplink_hz - link.tx_lo_hz - if s.cw && !s.digital { crate::keyer::TONE_HZ } else { 0.0 };
         let band = if offset.abs() > link.rate / 2.0 - TX_EDGE_HZ { Err(Refusal::OutsideTransponder) } else { s.band };
         // FT8/FT4: the scheduled audio instead of the microphone.
         let mut digital_on = false;
@@ -581,7 +603,29 @@ fn transmit(link: TxLink) {
         } else {
             feed = None;
         }
-        let keyed = if s.digital { digital_on } else { s.ptt || s.tune || vox.keyed() };
+        // CW: the keyer's tone instead of the microphone.
+        let mut cw_on = false;
+        if s.cw && !s.digital {
+            pending.clear();
+            let mut k = link.keyer.lock().unwrap();
+            if k.busy() {
+                cw_audio.clear();
+                k.render((link.mic_rate * TUNE_CHUNK_S) as usize, s.drive, &mut cw_audio);
+                pending.extend(&cw_audio);
+                cw_last = Some(Instant::now());
+            }
+            link.listener.set_sidetone(k.key_down());
+            cw_on = cw_last.is_some_and(|t| t.elapsed() < CW_HANG);
+        } else {
+            link.listener.set_sidetone(false);
+        }
+        let keyed = if s.digital {
+            digital_on
+        } else if s.cw {
+            cw_on
+        } else {
+            s.ptt || s.tune || vox.keyed()
+        };
         let state = control.update(Instant::now(), keyed, s.armed, device.is_some(), band);
         if s.tune {
             // The tone replaces the microphone.
@@ -602,8 +646,16 @@ fn transmit(link: TxLink) {
             }
             let m = modulator.as_mut().expect("modulator");
             // Digital audio goes out as made: no microphone gain, no compressor.
-            m.mic_gain = if s.digital { 1.0 } else { db_to_gain(s.mic_gain_db) };
-            m.compress = s.compress && !s.digital;
+            // Digital audio goes out as made, scaled by the drive (the CW keyer applies it
+            // itself); no microphone gain, no compressor.
+            m.mic_gain = if s.digital {
+                s.drive
+            } else if s.cw {
+                1.0
+            } else {
+                db_to_gain(s.mic_gain_db)
+            };
+            m.compress = s.compress && !s.digital && !s.cw;
             m.set_offset(offset);
             let mut result = Ok(());
             if attenuation != s.attenuation_db {
@@ -830,5 +882,49 @@ mod tests {
         assert_eq!(m.slot as f64, slot * 15.0);
         // The simulated transmitter is off by TX_ERROR_HZ.
         assert!((m.audio_hz - (1_500.0 + crate::sim::TX_ERROR_HZ)).abs() < 10.0);
+    }
+
+    /// CW from the keyer comes down on the dial (plus the simulated transmitter error):
+    /// `cargo test --release --lib cw_on_simulator -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cw_on_simulator() {
+        let config = StationConfig { microphone: Some("none".into()), speaker: Some("none".into()), ..Default::default() }.with_rate(0.6e6);
+        let listen = ListenSettings { dial_hz: 0.0, mode: Mode::Cw, bandwidth_hz: 500.0, audio_rate: 48e3, volume: 0.0 };
+        let engine = Engine::start(config, listen, TxSettings::default(), 0.0, || {});
+        let started = Instant::now();
+        while engine.correction().is_none() && started.elapsed() < Duration::from_secs(10) {
+            let _ = engine.events.recv_timeout(Duration::from_millis(200));
+        }
+        let correction = engine.correction().expect("beacon lock");
+        let dial = 10_489.620e6;
+        let lo = engine.config.lnb_lo_hz;
+        {
+            let mut tx = engine.tx.lock().unwrap();
+            tx.uplink_hz = crate::bandplan::uplink(dial);
+            tx.armed = true;
+            tx.cw = true;
+        }
+        engine.keyer.lock().unwrap().send("VVV VVV VVV");
+        let expected = dial + crate::sim::TX_ERROR_HZ - lo - correction;
+        *engine.view.lock().unwrap() = View { offset_hz: expected - engine.config.center_if(), span_hz: 6e3 };
+        let started = Instant::now();
+        let mut best: Option<(f32, f64)> = None;
+        while started.elapsed() < Duration::from_secs(4) {
+            if let Ok(Event::Frame(f)) = engine.events.recv_timeout(Duration::from_secs(1)) {
+                let (i, &v) = f.db.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+                let at = f.lo_hz + (i as f64 + 0.5) / f.db.len() as f64 * (f.hi_hz - f.lo_hz);
+                let mut sorted = f.db.clone();
+                sorted.sort_by(f32::total_cmp);
+                let over = v - sorted[sorted.len() / 2];
+                if best.is_none_or(|b| over > b.0) {
+                    best = Some((over, at));
+                }
+            }
+        }
+        let st = engine.tx_status.lock().unwrap().clone();
+        let (over, at) = best.expect("frames");
+        println!("CW peak {over:.1} dB at {:+.0} Hz from the dial; status {st:?}", at - expected);
+        assert!(over > 20.0 && (at - expected).abs() < 30.0);
     }
 }

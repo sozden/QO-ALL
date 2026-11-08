@@ -88,6 +88,13 @@ pub struct App {
     armed: bool,
     ptt_latched: bool,
     tune: bool,
+    /// Digital and CW audio level (0..1).
+    drive: f32,
+    /// CW: words per minute and the text box.
+    cw_wpm: f64,
+    cw_text: String,
+    /// The country file path being edited in the settings.
+    edit_cty: String,
     attenuation: f64,
     mic_gain_db: f32,
     compress: bool,
@@ -199,6 +206,10 @@ impl App {
             armed: false,
             ptt_latched: false,
             tune: false,
+            drive: s.get("drive").unwrap_or(1.0),
+            cw_wpm: s.get("cw_wpm").unwrap_or(20.0),
+            cw_text: String::new(),
+            edit_cty: s.text("cty_path").unwrap_or_default(),
             attenuation: s.get("tx_attenuation_db").unwrap_or(tx_defaults.attenuation_db),
             mic_gain_db: s.get("mic_gain_db").unwrap_or(0.0),
             compress: s.get("compress").unwrap_or(false),
@@ -323,6 +334,8 @@ impl App {
         let d = self.tx_signal();
         match self.digital {
             Some(p) => bandplan::check(d + self.ft.audio_hz, d + self.ft.audio_hz + FtPanel::signal_width(p)),
+            // CW: the carrier on the dial and its keying sidebands.
+            None if self.mode == Mode::Cw => bandplan::check(d - 100.0, d + 100.0),
             None => bandplan::check(d + qo_all::tx::AUDIO_LOW, d + qo_all::tx::AUDIO_HIGH),
         }
     }
@@ -376,7 +389,9 @@ impl App {
             tx.compress = self.compress;
             tx.vox = self.vox;
             // CW transmission comes in a later version.
-            tx.armed = self.armed && self.mode != Mode::Cw;
+            tx.armed = self.armed;
+            tx.cw = self.mode == Mode::Cw && self.digital.is_none();
+            tx.drive = self.drive;
             tx.tune = self.tune && tx.armed;
             tx.band = self.tx_band();
             tx.digital = self.digital.is_some();
@@ -386,7 +401,10 @@ impl App {
         let ft_dial = if self.digital.is_some() { self.rx_dial } else { FT_DIAL_HZ };
         e.ft8.set_dial(Some(to_if(ft_dial)));
         // The own signal's carrier should come down on the transmit dial (plus XIT).
-        e.selfcheck.set_expected(Some(to_if(self.tx_signal())));
+        // In CW the modulator's carrier sits the tone's pitch below the dial.
+        let carrier = self.tx_signal() - if self.mode == Mode::Cw && self.digital.is_none() { qo_all::keyer::TONE_HZ } else { 0.0 };
+        e.selfcheck.set_expected(Some(to_if(carrier)));
+        e.keyer.lock().unwrap().wpm = self.cw_wpm;
         let ft4 = self.ft4_on || self.digital.is_some_and(|p| std::ptr::eq(p, &FT4));
         e.ft4.set_dial(ft4.then(|| to_if(ft_dial)));
         let (lo, hi) = self.view_band();
@@ -503,6 +521,8 @@ impl App {
         s.set_opt("anti_vox_db", self.vox.anti_vox_db);
         s.set("time_out_s", self.time_out_s);
         s.set("volume", self.volume);
+        s.set("drive", self.drive);
+        s.set("cw_wpm", self.cw_wpm);
         s.set("muted", self.muted);
         s.set("zoom", self.zoom);
         s.set("ft4", self.ft4_on);
@@ -966,10 +986,19 @@ impl App {
             ui.spacing_mut().slider_width = 70.0;
             ui.add(egui::Slider::new(&mut power, -MAX_ATTENUATION..=0.0).suffix(" dB").step_by(0.5));
             self.attenuation = -power;
+            if self.digital.is_some() || self.mode == Mode::Cw {
+                // The level of the digital/CW audio: the power through the sound, as
+                // WSJT-X's Pwr slider.
+                ui.label(RichText::new("Drive").size(11.0).color(MUTED));
+                let mut d = (self.drive * 100.0).round();
+                ui.add(egui::Slider::new(&mut d, 5.0..=100.0).suffix(" %").step_by(1.0).fixed_decimals(0));
+                self.drive = d / 100.0;
+            }
             ui.add_space(2.0);
             let on = status.state == TxState::Transmit;
-            // In FT8/FT4 the sequence keys the transmitter: no PTT, no tune tone.
-            if self.digital.is_none() {
+            // In FT8/FT4 the sequence keys the transmitter, in CW the keyer: no PTT, no
+            // tune tone.
+            if self.digital.is_none() && self.mode != Mode::Cw {
                 let tune_text = self.t("Tune 1 kHz", "Ton 1 kHz");
                 if ui::choice(ui, tune_text, self.tune, TX) && can && self.armed {
                     self.tune = !self.tune;
@@ -1024,10 +1053,78 @@ impl App {
             if let Some(e) = &status.error {
                 ui.label(RichText::new(e).size(11.0).color(TX));
             }
-            if self.mode == Mode::Cw {
-                ui.label(RichText::new(self.t("CW sending comes later", "CW gönderimi sonraki sürümde")).size(11.0).color(DIM));
+        });
+    }
+
+    /// CW sending: text, ready messages, speed, a straight key and paddles.
+    fn cw_card(&mut self, ui: &mut egui::Ui) {
+        let Some(e) = self.engine.as_ref() else { return };
+        let keyer = e.keyer.clone();
+        let call = self.ft.seq.my_call.clone();
+        ui.horizontal(|ui| {
+            ui::caption(ui, self.t("CW SENDING", "CW GÖNDERME"), TX);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Slider::new(&mut self.cw_wpm, 8.0..=40.0).suffix(" WPM").step_by(1.0).fixed_decimals(0));
+            });
+        });
+        if !self.armed {
+            ui.label(RichText::new(self.t("Switch TX on (right) to send", "Göndermek için sağdaki TX'i açın")).size(11.0).color(RX));
+        }
+        // Text: Enter sends it.
+        let hint = self.t("Text to send, Enter", "Gönderilecek metin, Enter");
+        let r = ui.add(egui::TextEdit::singleline(&mut self.cw_text).desired_width(ui.available_width()).hint_text(hint));
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut send: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui::choice(ui, self.t("Send", "Gönder"), false, TX) || enter {
+                send = Some(self.cw_text.clone());
+                self.cw_text.clear();
+            }
+            if ui::choice(ui, self.t("Stop", "Durdur"), false, TX) {
+                keyer.lock().unwrap().stop();
+            }
+            let me = if call.is_empty() { "DE".to_string() } else { call.clone() };
+            for (label, text) in [
+                ("CQ", format!("CQ CQ CQ DE {me} {me} K")),
+                ("DE", format!("DE {me} K")),
+                ("599", "UR 599 5NN BK".to_string()),
+                ("73", format!("TU 73 DE {me} <SK>")),
+            ] {
+                if ui::choice(ui, label, false, BLUE) {
+                    send = Some(text);
+                }
             }
         });
+        if let Some(text) = send.filter(|t| !t.trim().is_empty())
+            && self.armed
+        {
+            keyer.lock().unwrap().send(&text.to_uppercase());
+        }
+        let left = keyer.lock().unwrap().text_left();
+        if left > 0 {
+            let secs = left as f64 * 1.2 / self.cw_wpm;
+            ui.label(RichText::new(format!("{} · {secs:.0} s", self.t("Sending", "Gönderiliyor"))).size(11.0).color(TX));
+        }
+        ui.add_space(4.0);
+        // The keys: held with the mouse (or [ ] and Space on the keyboard).
+        ui.horizontal(|ui| {
+            let key = |ui: &mut egui::Ui, label: &str| {
+                let b = egui::Button::new(RichText::new(label).size(15.0).strong()).min_size(vec2(64.0, 40.0));
+                ui.add(b).is_pointer_button_down_on()
+            };
+            let straight = key(ui, self.t("KEY", "ANAHTAR"));
+            ui.add_space(8.0);
+            let dit = key(ui, "· dit");
+            let dah = key(ui, "— dah");
+            let typing = ui.ctx().egui_wants_keyboard_input();
+            let (k_straight, k_dit, k_dah) = ui.input(|i| (i.key_down(egui::Key::Space), i.key_down(egui::Key::OpenBracket), i.key_down(egui::Key::CloseBracket)));
+            let armed = self.armed;
+            let mut k = keyer.lock().unwrap();
+            k.straight = armed && (straight || (k_straight && !typing));
+            k.dit = armed && (dit || (k_dit && !typing));
+            k.dah = armed && (dah || (k_dah && !typing));
+        });
+        ui.label(RichText::new(self.t("Keyboard: Space = key, [ = dit, ] = dah", "Klavye: Boşluk = anahtar, [ = dit, ] = dah")).size(11.0).color(DIM));
     }
 
     /// FT8/FT4: band activity, the contact, the controls and the transmitter.
@@ -1036,8 +1133,10 @@ impl App {
         let armed = self.armed && matches!(self.tx_capable, Some(Ok(())));
         ui.horizontal_top(|ui| {
             let w = ui.available_width();
-            let (qso, controls, tx) = (340.0f32.min(w * 0.25), 360.0f32, 200.0f32);
-            let activity = (w - qso - controls - tx - 3.0 * ui.spacing().item_spacing.x - 40.0).max(260.0);
+            // Band activity, the contact and the controls equally wide.
+            let tx = 200.0f32;
+            let third = ((w - tx - 3.0 * ui.spacing().item_spacing.x - 40.0) / 3.0).max(260.0);
+            let (activity, qso, controls) = (third, third, third);
             let column = egui::Layout::top_down(egui::Align::Min);
             ui.allocate_ui_with_layout(vec2(activity, h), column, |ui| {
                 ui::card(ui, DEEP, |ui| {
@@ -1174,6 +1273,31 @@ impl App {
             });
             ui.label(RichText::new(format!("{} {}", self.ft.worked.len(), self.t("stations in the log", "istasyon logda"))).size(11.0).color(DIM));
             ui.add_space(8.0);
+            ui::caption(ui, self.t("ALERTS (FT8/FT4)", "UYARILAR (FT8/FT4)"), ftpanel::ALERT_COLOR);
+            egui::Grid::new("alerts").num_columns(3).spacing(vec2(10.0, 3.0)).show(ui, |ui| {
+                ui.label("");
+                ui.label(RichText::new(self.t("show", "göster")).size(11.0).color(MUTED));
+                ui.label(RichText::new(self.t("sound", "ses")).size(11.0).color(MUTED));
+                ui.end_row();
+                ui.label(self.t("New DXCC", "Yeni DXCC"));
+                ui.checkbox(&mut self.ft.alerts.dxcc_show, "");
+                ui.checkbox(&mut self.ft.alerts.dxcc_sound, "");
+                ui.end_row();
+                ui.label(self.t("New locator (square)", "Yeni lokatör (kare)"));
+                ui.checkbox(&mut self.ft.alerts.grid_show, "");
+                ui.checkbox(&mut self.ft.alerts.grid_sound, "");
+                ui.end_row();
+            });
+            ui.label(self.t("Country file (cty.dat)", "Ülke dosyası (cty.dat)"));
+            let hint = self.t("found automatically", "kendiliğinden bulunur");
+            ui.add(egui::TextEdit::singleline(&mut self.edit_cty).desired_width(ui.available_width() - 10.0).hint_text(hint));
+            let (worked, known) = self.ft.entity_counts();
+            let cty_state = match &self.ft.cty_path {
+                Some(p) if known > 0 => format!("{known} {} · {worked} {} · {}", self.t("entities", "ülke"), self.t("worked", "çalışılmış"), p.display()),
+                _ => self.t("Not found: install WSJT-X or give the file", "Bulunamadı: WSJT-X kurun ya da dosyayı girin").to_string(),
+            };
+            ui.label(RichText::new(cty_state).size(11.0).color(DIM));
+            ui.add_space(8.0);
             ui::caption(ui, self.t("SOUND", "SES"), GOOD);
             let default = self.t("System default", "Sistem varsayılanı");
             let name_of = |list: &[qo_all::audio::OutputDevice], id: &Option<String>| {
@@ -1206,6 +1330,8 @@ impl App {
                 self.config.microphone = self.edit_mic.clone();
                 self.config.speaker = self.edit_speaker.clone();
                 self.ft.set_station(&self.edit_call, &self.edit_grid, std::path::PathBuf::from(self.edit_log.trim()));
+                let cty = self.edit_cty.trim();
+                self.ft.set_cty((!cty.is_empty()).then(|| std::path::PathBuf::from(cty)));
                 self.save();
                 self.start(ui.ctx());
                 self.show_settings = false;
@@ -1256,7 +1382,8 @@ impl eframe::App for App {
             self.ptt_latched = false;
             self.tune = false;
         }
-        let ptt = self.armed && (self.ptt_latched || (space && !typing));
+        let cw = self.mode == Mode::Cw && self.digital.is_none();
+        let ptt = self.armed && !cw && (self.ptt_latched || (space && !typing));
         self.set_ptt(ptt);
         self.sync();
         if let (Some(p), Some(e)) = (self.digital, self.engine.as_ref()) {
@@ -1303,7 +1430,11 @@ impl eframe::App for App {
                     ui.allocate_ui_with_layout(vec2(side, h), column, |ui| {
                         ui::card(ui, CARD, |ui| {
                             ui.set_min_size(vec2(ui.available_width(), h - 18.0));
-                            self.sound(ui);
+                            if self.mode == Mode::Cw {
+                                self.cw_card(ui);
+                            } else {
+                                self.sound(ui);
+                            }
                         });
                     });
                     ui.allocate_ui_with_layout(vec2(ptt, h), column, |ui| {

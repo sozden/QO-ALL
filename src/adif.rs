@@ -140,6 +140,8 @@ pub enum Status {
 #[derive(Clone, Debug, Default)]
 pub struct Worked {
     calls: HashMap<String, HashSet<String>>,
+    /// Every grid square worked, whoever from.
+    grids: HashSet<String>,
 }
 
 fn grid4(g: &str) -> String {
@@ -164,6 +166,7 @@ impl Worked {
         let set = self.calls.entry(call.trim().to_ascii_uppercase()).or_default();
         if let Some(g) = grid.filter(|g| g.trim().len() >= 4) {
             set.insert(grid4(g));
+            self.grids.insert(grid4(g));
         }
     }
 
@@ -179,6 +182,16 @@ impl Worked {
 
     pub fn len(&self) -> usize {
         self.calls.len()
+    }
+
+    /// Whether a grid square (its first four characters) was ever worked.
+    pub fn grid_worked(&self, grid: &str) -> bool {
+        self.grids.contains(&grid4(grid))
+    }
+
+    /// The calls in the log.
+    pub fn calls(&self) -> impl Iterator<Item = &str> {
+        self.calls.keys().map(String::as_str)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -243,6 +256,8 @@ mod tests {
         assert_eq!(w.status("DL1ABC", None), Status::Worked);
         assert_eq!(w.status("EA7HJ", Some("IM76")), Status::Worked, "no grid in the log: nothing to compare");
         assert_eq!(w.status("OE3XYZ", Some("JN88")), Status::New);
+        assert!(w.grid_worked("jo62") && !w.grid_worked("JN88"));
+        assert_eq!(w.calls().count(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

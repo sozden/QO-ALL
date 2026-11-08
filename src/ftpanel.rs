@@ -8,7 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, vec2};
 
+use std::collections::HashSet;
+
 use qo_all::adif::{self, Contact, Status, Worked};
+use qo_all::dxcc::Cty;
 use qo_all::engine::{DigitalJob, Engine};
 use qo_all::ft8::qso::{Heard, Parsed, Payload, Sequencer, Step, format_report, parse};
 use qo_all::ft8::worker::Ft8Message;
@@ -23,6 +26,22 @@ const NEW_CQ_BG: Color32 = Color32::from_rgb(0x15, 0x3d, 0x28);
 const NEW_GRID_BG: Color32 = Color32::from_rgb(0x34, 0x24, 0x5c);
 const OWN: Color32 = RX;
 const WORKED: Color32 = Color32::from_rgb(0x6a, 0x7b, 0x93);
+/// Alert colours: a new DXCC entity, a new grid square.
+const NEW_DXCC_BG: Color32 = Color32::from_rgb(0x6b, 0x40, 0x0c);
+const NEW_SQUARE_BG: Color32 = Color32::from_rgb(0x0d, 0x4a, 0x52);
+const ALERT: Color32 = Color32::from_rgb(0xff, 0xb3, 0x4d);
+pub const ALERT_COLOR: Color32 = ALERT;
+/// How long an alert stays in the panel's title (s).
+const ALERT_SHOWN_S: f64 = 30.0;
+
+/// Which alerts are on: shown (row colour and a line in the title) and heard (a beep).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Alerts {
+    pub dxcc_show: bool,
+    pub dxcc_sound: bool,
+    pub grid_show: bool,
+    pub grid_sound: bool,
+}
 /// Messages shown in the band activity.
 const SHOWN: usize = 150;
 /// FT8 and FT4 tones span this much audio (Hz).
@@ -68,6 +87,14 @@ pub struct FtPanel {
     qso_lines: Vec<(String, Color32)>,
     status: String,
     audio: HashMap<(String, &'static str, u64), Arc<Vec<f32>>>,
+    /// The country file (from WSJT-X/JTDX or the settings), the entities in the log, the
+    /// alerts and what was already alerted this session.
+    pub cty: Option<Cty>,
+    pub cty_path: Option<PathBuf>,
+    worked_entities: HashSet<String>,
+    pub alerts: Alerts,
+    alerted: HashSet<String>,
+    banner: Option<(String, f64)>,
 }
 
 /// Default log: next to the settings.
@@ -91,7 +118,14 @@ impl FtPanel {
         let log_path = s.text("adif_path").map(PathBuf::from).unwrap_or_else(default_log);
         let mut seq = Sequencer::new(&s.text("my_call").unwrap_or_default(), &s.text("my_grid").unwrap_or_default());
         seq.max_repeats = s.get("ft_max_repeats").unwrap_or(6);
-        Self {
+        let cty_path = s.text("cty_path").map(PathBuf::from).filter(|p| p.is_file()).or_else(qo_all::dxcc::find_file);
+        let alerts = Alerts {
+            dxcc_show: s.get("alert_dxcc_show").unwrap_or(true),
+            dxcc_sound: s.get("alert_dxcc_sound").unwrap_or(true),
+            grid_show: s.get("alert_grid_show").unwrap_or(true),
+            grid_sound: s.get("alert_grid_sound").unwrap_or(false),
+        };
+        let mut panel = Self {
             seq,
             enabled: false,
             auto_seq: s.get("ft_auto_seq").unwrap_or(true),
@@ -108,7 +142,44 @@ impl FtPanel {
             qso_lines: Vec::new(),
             status: String::new(),
             audio: HashMap::new(),
-        }
+            cty: cty_path.as_deref().and_then(Cty::load),
+            cty_path,
+            worked_entities: HashSet::new(),
+            alerts,
+            alerted: HashSet::new(),
+            banner: None,
+        };
+        panel.count_entities();
+        panel
+    }
+
+    /// The DXCC entities of the calls in the log.
+    fn count_entities(&mut self) {
+        self.worked_entities = match &self.cty {
+            Some(c) => self.worked.calls().filter_map(|call| c.entity(call)).map(|e| e.name.clone()).collect(),
+            None => HashSet::new(),
+        };
+    }
+
+    /// Another country file.
+    pub fn set_cty(&mut self, path: Option<PathBuf>) {
+        let path = path.filter(|p| p.is_file()).or_else(qo_all::dxcc::find_file);
+        self.cty = path.as_deref().and_then(Cty::load);
+        self.cty_path = path;
+        self.count_entities();
+    }
+
+    /// Entities worked, and those the country file knows (for the settings).
+    pub fn entity_counts(&self) -> (usize, usize) {
+        (self.worked_entities.len(), self.cty.as_ref().map_or(0, Cty::len))
+    }
+
+    /// What is new about a station: a DXCC entity, a grid square.
+    fn novelty(&self, call: &str, grid: Option<&str>) -> (bool, bool) {
+        let entity = self.cty.as_ref().and_then(|c| c.entity(call));
+        let new_dxcc = entity.is_some_and(|e| !self.worked_entities.contains(&e.name));
+        let new_grid = grid.is_some_and(|g| !self.worked.grid_worked(g));
+        (new_dxcc, new_grid)
     }
 
     pub fn save(&self, s: &mut Settings) {
@@ -119,6 +190,11 @@ impl FtPanel {
         s.set("ft_audio_hz", self.audio_hz);
         s.set("ft_cq_odd", self.cq_odd);
         s.set("ft_max_repeats", self.seq.max_repeats);
+        s.set_opt("cty_path", self.cty_path.as_ref().map(|p| p.display()));
+        s.set("alert_dxcc_show", self.alerts.dxcc_show);
+        s.set("alert_dxcc_sound", self.alerts.dxcc_sound);
+        s.set("alert_grid_show", self.alerts.grid_show);
+        s.set("alert_grid_sound", self.alerts.grid_sound);
     }
 
     /// New station details or log file (from the settings).
@@ -128,6 +204,7 @@ impl FtPanel {
         self.seq.max_repeats = max;
         self.worked = Worked::load(&log);
         self.log_path = log;
+        self.count_entities();
     }
 
     pub fn signal_width(p: &Protocol) -> f64 {
@@ -184,6 +261,36 @@ impl FtPanel {
                     self.line(format!("{} {:+3.0} {:4.0}  {}", hms(m.slot), m.snr_db, m.audio_hz, m.text), color);
                 }
             }
+            // New DXCC entities and grid squares calling CQ: shown and/or heard, once
+            // per station and session.
+            let mut beep = false;
+            for m in &messages {
+                let Parsed::Cq { from, grid } = parse(&m.text) else { continue };
+                if from == self.seq.my_call || self.alerted.contains(&from) {
+                    continue;
+                }
+                let (new_dxcc, new_grid) = self.novelty(&from, grid.as_deref());
+                let a = self.alerts;
+                let what = if new_dxcc && (a.dxcc_show || a.dxcc_sound) {
+                    let name = self.cty.as_ref().and_then(|c| c.entity(&from)).map_or(String::new(), |e| e.name.clone());
+                    beep |= a.dxcc_sound;
+                    Some((format!("{}: {name} ({from})", t("New DXCC", "Yeni DXCC")), a.dxcc_show))
+                } else if new_grid && (a.grid_show || a.grid_sound) {
+                    beep |= a.grid_sound;
+                    Some((format!("{}: {} ({from})", t("New locator", "Yeni lokatör"), grid.clone().unwrap_or_default()), a.grid_show))
+                } else {
+                    None
+                };
+                if let Some((text, show)) = what {
+                    self.alerted.insert(from.clone());
+                    if show {
+                        self.banner = Some((text, now));
+                    }
+                }
+            }
+            if beep {
+                e.listener.beep();
+            }
             if self.auto_seq && !self.seq.my_call.is_empty() {
                 let heard: Vec<Heard> = messages.iter().map(|m| Heard { text: m.text.clone(), snr: m.snr_db.round() as i32, odd }).collect();
                 let busy_before = self.seq.dx.as_ref().map(|d| d.call.clone());
@@ -235,6 +342,9 @@ impl FtPanel {
             match adif::append(&self.log_path, &c) {
                 Ok(()) => {
                     self.worked.add(&c.call, c.grid.as_deref());
+                    if let Some(entity) = self.cty.as_ref().and_then(|cty| cty.entity(&c.call)) {
+                        self.worked_entities.insert(entity.name.clone());
+                    }
                     self.line(format!("LOG {} {} {} {}/{}", c.call, c.grid.clone().unwrap_or_default(), p.name, c.rst_sent, c.rst_rcvd), GOOD);
                     self.status = format!("{} {}", t("Logged", "Loglandı:"), c.call);
                 }
@@ -300,6 +410,12 @@ impl FtPanel {
         match parse(text) {
             Parsed::Directed { to, .. } if !me.is_empty() && to == *me => (Some(TO_ME_BG), Color32::WHITE),
             Parsed::Directed { from, .. } | Parsed::Cq { from, .. } if !me.is_empty() && from == *me => (None, OWN),
+            Parsed::Cq { from, grid } if self.alerts.dxcc_show && self.novelty(&from, grid.as_deref()).0 => {
+                (Some(NEW_DXCC_BG), Color32::WHITE)
+            }
+            Parsed::Cq { from, grid } if self.alerts.grid_show && self.novelty(&from, grid.as_deref()).1 => {
+                (Some(NEW_SQUARE_BG), Color32::WHITE)
+            }
             Parsed::Cq { from, grid } => match self.worked.status(&from, grid.as_deref()) {
                 Status::New => (Some(NEW_CQ_BG), Color32::WHITE),
                 Status::NewGrid => (Some(NEW_GRID_BG), Color32::WHITE),
@@ -325,6 +441,17 @@ impl FtPanel {
             ui::pill(ui, t("new locator", "yeni lokatör"), Color32::WHITE, NEW_GRID_BG);
             ui::pill(ui, t("worked", "çalışılmış"), WORKED, RAISED);
             ui::pill(ui, t("to me", "bana"), Color32::WHITE, TO_ME_BG);
+            if self.alerts.dxcc_show && self.cty.is_some() {
+                ui::pill(ui, t("new DXCC", "yeni DXCC"), Color32::WHITE, NEW_DXCC_BG);
+            }
+            if self.alerts.grid_show {
+                ui::pill(ui, t("new square", "yeni kare"), Color32::WHITE, NEW_SQUARE_BG);
+            }
+            if let Some((text, at)) = &self.banner
+                && now_utc() - at < ALERT_SHOWN_S
+            {
+                ui.label(RichText::new(format!("★ {text}")).size(13.0).strong().color(ALERT));
+            }
         });
         let worker = if std::ptr::eq(p, &FT8) { &e.ft8 } else { &e.ft4 };
         let messages = worker.messages();
@@ -340,7 +467,12 @@ impl FtPanel {
                 }
                 last_slot = Some(m.slot);
                 let (bg, fg) = self.colors(&m.text);
-                let text = format!("{} {:+3.0} {:+4.1} {:4.0}  {}", hms(m.slot), m.snr_db, m.dt_s, m.audio_hz, m.text);
+                let mut text = format!("{} {:+3.0} {:+4.1} {:4.0}  {}", hms(m.slot), m.snr_db, m.dt_s, m.audio_hz, m.text);
+                if let (Parsed::Cq { from, .. }, Some(c)) = (parse(&m.text), &self.cty)
+                    && let Some(entity) = c.entity(&from)
+                {
+                    text += &format!("   {}", entity.name);
+                }
                 let frame = egui::Frame::new().fill(bg.unwrap_or(Color32::TRANSPARENT)).corner_radius(CornerRadius::same(3)).inner_margin(egui::Margin::symmetric(4, 1));
                 let r = frame
                     .show(ui, |ui| {

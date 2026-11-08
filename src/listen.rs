@@ -1,7 +1,7 @@
 //! The listening thread: takes blocks from the receiver, demodulates the dial frequency
 //! and keeps the sound card's queue at a steady level.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,7 +50,16 @@ pub struct Listener {
     /// Level of the audio sent to the speaker (dBFS, after the volume).
     speaker: Arc<AtomicU32>,
     cw: Arc<Mutex<Option<CwInfo>>>,
+    /// CW sidetone on (the key is down), and samples of alert beep left.
+    sidetone: Arc<AtomicBool>,
+    beep: Arc<AtomicU32>,
 }
+
+/// Sidetone pitch and level, alert beep tones and length.
+const SIDETONE_HZ: f64 = crate::keyer::TONE_HZ;
+const SIDETONE_LEVEL: f32 = 0.25;
+const BEEP_HZ: (f64, f64) = (880.0, 1_320.0);
+const BEEP_S: f64 = 0.36;
 
 fn atomic(v: f32) -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(v.to_bits()))
@@ -58,7 +67,14 @@ fn atomic(v: f32) -> Arc<AtomicU32> {
 
 impl Listener {
     pub fn new(settings: ListenSettings) -> Self {
-        Self { settings: Arc::new(Mutex::new(settings)), level: atomic(-150.0), speaker: atomic(-150.0), cw: Arc::default() }
+        Self {
+            settings: Arc::new(Mutex::new(settings)),
+            level: atomic(-150.0),
+            speaker: atomic(-150.0),
+            cw: Arc::default(),
+            sidetone: Arc::default(),
+            beep: Arc::default(),
+        }
     }
 
     pub fn update(&self, f: impl FnOnce(&mut ListenSettings)) {
@@ -78,6 +94,17 @@ impl Listener {
         self.cw.lock().unwrap().clone()
     }
 
+    /// The CW sidetone follows the key.
+    pub fn set_sidetone(&self, on: bool) {
+        self.sidetone.store(on, Ordering::Relaxed);
+    }
+
+    /// A short two-tone beep on the speaker (alerts).
+    pub fn beep(&self) {
+        let rate = self.settings.lock().unwrap().audio_rate;
+        self.beep.store((BEEP_S * rate) as u32, Ordering::Relaxed);
+    }
+
     /// Runs until the receiver stops (its block channel closes).
     pub fn spawn(&self, blocks: Receiver<Block>, audio: AudioBuffer) {
         let me = self.clone();
@@ -89,6 +116,8 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer) {
     let mut chain: Option<Chain> = None;
     let mut cw_dial = f64::NAN;
     let mut out = Vec::new();
+    // Phases of the sidetone and of the beep.
+    let (mut side_phase, mut beep_phase) = (0.0f64, 0.0f64);
     loop {
         let block = match blocks.recv_timeout(Duration::from_millis(500)) {
             Ok(b) => b,
@@ -128,6 +157,29 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer) {
         let power = out.iter().map(|v| v * v).sum::<f32>() / out.len().max(1) as f32;
         let speaker = 10.0 * (power * s.volume * s.volume + 1e-15).log10();
         me.speaker.store(speaker.to_bits(), Ordering::Relaxed);
+        // Sidetone and alert beep, on top of what is heard.
+        let sidetone = me.sidetone.load(Ordering::Relaxed);
+        let mut beep = me.beep.load(Ordering::Relaxed);
+        if sidetone || beep > 0 {
+            let total = (BEEP_S * s.audio_rate) as u32;
+            for v in out.iter_mut() {
+                if sidetone {
+                    side_phase = (side_phase + 2.0 * std::f64::consts::PI * SIDETONE_HZ / s.audio_rate) % (2.0 * std::f64::consts::PI);
+                    *v += SIDETONE_LEVEL * side_phase.sin() as f32;
+                }
+                if beep > 0 {
+                    // Two tones, with a short pause between them.
+                    let into = total.saturating_sub(beep) as f64 / total as f64;
+                    let hz = if into < 0.45 { BEEP_HZ.0 } else { BEEP_HZ.1 };
+                    beep_phase = (beep_phase + 2.0 * std::f64::consts::PI * hz / s.audio_rate) % (2.0 * std::f64::consts::PI);
+                    if !(0.45..0.55).contains(&into) {
+                        *v += 0.3 * beep_phase.sin() as f32;
+                    }
+                    beep -= 1;
+                }
+            }
+            me.beep.store(beep, Ordering::Relaxed);
+        }
         audio.push(&out);
         *me.cw.lock().unwrap() = chain.cw.as_ref().map(|d| CwInfo { text: d.text().to_string(), wpm: d.wpm(), key_down: d.key_down() });
     }
