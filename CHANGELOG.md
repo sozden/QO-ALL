@@ -16,8 +16,9 @@
   rule for a Pluto on USB, a menu entry.
 - The chosen decoder tab is remembered.
 
-Windows 32-bit: Analog Devices publishes libiio for 64-bit Windows only, so there is
-no 32-bit package yet.
+- **Windows 32-bit** package (`windows-x86`): Analog Devices publishes libiio for 64-bit
+  Windows only, so its `libiio.dll` is built from source (libiio 0.26 with libxml2 and
+  libusb inside, `tools/build-libiio-w32.sh`); nothing else to install.
 
 ## 0.4.0 — 2026-11-08 (first public version)
 

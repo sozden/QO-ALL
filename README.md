@@ -8,7 +8,7 @@ time with one ADALM-Pluto (or a similar AD936x radio over Ethernet or USB).
 
 **Status: 0.5.0.** SSB, FT8, the beacon lock and the automatic uplink correction are in
 use on the air with a Pluto on Ethernet; CW sending is new.
-Windows (64-bit) and Linux (x86-64) packages.
+Windows (64-bit and 32-bit) and Linux (x86-64) packages.
 Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
 [changelog](CHANGELOG.md) for what is in it and the known issues.
 
@@ -20,7 +20,8 @@ Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). Se
 
 Windows: download `QO-ALL-<version>-windows-x64.zip` from the
 [releases](https://github.com/sozden/QO-ALL/releases), unpack it and run `qo-all.exe`
-(libiio and its libraries are in the package). It starts on
+(libiio and its libraries are in the package; on 32-bit Windows take
+`QO-ALL-<version>-windows-x86.zip`). It starts on
 the **simulator** (no radio needed): the transponder with beacons and some users, a
 drifting LNB, and your own transmission coming back a quarter second later. Choose the
 radio under Settings (e.g. `192.168.2.1`). `qo-all.exe --diagnose 192.168.2.1` prints
@@ -84,8 +85,8 @@ alıcı-verici. Tek bir ADALM-Pluto (veya Ethernet/USB ile bağlı benzer AD936x
 10 GHz'de dinlerken aynı anda 2.4 GHz'de yayın yapılır.
 
 **Durum: 0.5.0.** SSB, FT8, beacon kilidi ve otomatik uplink
-düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows (64 bit)
-ve Linux paketleri [sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında;
+düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows (64 ve
+32 bit) ve Linux paketleri [sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında;
 Windows'ta açıp `qo-all.exe`'yi çalıştırmak yeterli, Linux'ta `INSTALL.txt`'ye bakın. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)
 bölümüne yazabilirsiniz; ayrıntılar [değişiklikler](CHANGELOG.md) dosyasında.
 
