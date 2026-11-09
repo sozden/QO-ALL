@@ -379,27 +379,26 @@ impl LogPanel {
             Editing::Record(_) => t("CORRECT QSO", "QSO DÜZELT"),
         };
         ui::caption(ui, title, GOOD());
-        egui::Grid::new("log_form").num_columns(4).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        // Two rows, so it fits the log's strip at the bottom of the window.
+        egui::Grid::new("log_form").num_columns(8).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
             let field = |ui: &mut egui::Ui, label: &str, value: &mut String, w: f32| {
                 ui.label(RichText::new(label).size(12.0).color(MUTED()));
                 ui.add(egui::TextEdit::singleline(value).desired_width(w));
             };
             field(ui, t("Call", "Çağrı"), &mut form.call, 110.0);
             field(ui, t("Name", "İsim"), &mut form.name, 130.0);
-            ui.end_row();
-            field(ui, t("Date", "Tarih"), &mut form.date, 110.0);
-            field(ui, "UTC", &mut form.time, 70.0);
+            field(ui, t("Date", "Tarih"), &mut form.date, 100.0);
+            field(ui, "UTC", &mut form.time, 60.0);
             ui.end_row();
             field(ui, t("Sent", "Verilen"), &mut form.sent, 60.0);
             field(ui, t("Rcvd", "Alınan"), &mut form.rcvd, 60.0);
-            ui.end_row();
             ui.label(RichText::new(t("Mode", "Mod")).size(12.0).color(MUTED()));
             egui::ComboBox::from_id_salt("log_mode").selected_text(&form.mode).width(80.0).show_ui(ui, |ui| {
                 for m in ["SSB", "CW", "FT8", "FT4"] {
                     ui.selectable_value(&mut form.mode, m.to_string(), m);
                 }
             });
-            field(ui, t("Locator", "Lokatör"), &mut form.grid, 70.0);
+            field(ui, t("Locator", "Lokatör"), &mut form.grid, 60.0);
             ui.end_row();
         });
         ui.add_space(4.0);

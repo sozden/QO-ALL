@@ -8,6 +8,46 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
+/// The rate audio runs at inside the station (Hz). A sound device working at another
+/// rate is resampled to it, so devices can be changed while the station runs.
+pub const RATE: f64 = 48_000.0;
+
+/// Linear resampling of a stream (enough for voice and the speaker; the digital modes
+/// are made and decoded at `RATE`).
+pub struct Resampler {
+    /// Input samples per output sample.
+    step: f64,
+    pos: f64,
+    prev: f32,
+    cur: f32,
+}
+
+impl Resampler {
+    pub fn new(from: f64, to: f64) -> Self {
+        Self { step: from / to, pos: 0.0, prev: 0.0, cur: 0.0 }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        (self.step - 1.0).abs() < 1e-9
+    }
+
+    pub fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        if self.is_identity() {
+            out.extend_from_slice(input);
+            return;
+        }
+        for &x in input {
+            self.prev = self.cur;
+            self.cur = x;
+            while self.pos < 1.0 {
+                out.push(self.prev + (self.cur - self.prev) * self.pos as f32);
+                self.pos += self.step;
+            }
+            self.pos -= 1.0;
+        }
+    }
+}
+
 /// Mono audio waiting for the sound card. The demodulator fills it, the sound card's
 /// callback empties it.
 #[derive(Clone, Default)]
@@ -151,13 +191,28 @@ fn build<T: SizedSample + FromSample<f32>>(
     volume: Volume,
 ) -> Result<cpal::Stream, String> {
     let channels = config.channels.max(1) as usize;
-    let mut mono = Vec::new();
+    let mut resampler = Resampler::new(RATE, config.sample_rate as f64);
+    let (mut mono, mut chunk, mut made) = (Vec::new(), Vec::new(), Vec::new());
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
-                mono.resize(data.len() / channels, 0.0);
-                buffer.pop_into(&mut mono);
+                let n = data.len() / channels;
+                if resampler.is_identity() {
+                    mono.resize(n, 0.0);
+                    buffer.pop_into(&mut mono);
+                } else {
+                    // Station audio in until enough comes out; the rest waits for the
+                    // next call.
+                    while made.len() < n {
+                        let want = (((n - made.len()) as f64 * resampler.step).ceil() as usize).max(1);
+                        chunk.resize(want, 0.0);
+                        buffer.pop_into(&mut chunk);
+                        resampler.push(&chunk, &mut made);
+                    }
+                    mono.clear();
+                    mono.extend(made.drain(..n));
+                }
                 let gain = volume.get();
                 for (frame, &v) in data.chunks_exact_mut(channels).zip(&mono) {
                     let s = T::from_sample((v * gain).clamp(-1.0, 1.0));
@@ -224,12 +279,15 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels.max(1) as usize;
+    let mut resampler = Resampler::new(config.sample_rate as f64, RATE);
     device
         .build_input_stream(
             config,
             move |data: &[T], _| {
                 let mono: Vec<f32> = data.chunks_exact(channels).map(|frame| f32::from_sample_(frame[0])).collect();
-                let _ = sink.try_send(mono);
+                let mut out = Vec::with_capacity(mono.len() + 16);
+                resampler.push(&mono, &mut out);
+                let _ = sink.try_send(out);
             },
             |e| eprintln!("audio input: {e}"),
             None,
@@ -259,6 +317,20 @@ mod tests {
         let mut out = [9.0; 1];
         b.pop_into(&mut out);
         assert_eq!(out, [0.0], "after an underrun playback waits to prime again");
+    }
+
+    #[test]
+    fn resampling_keeps_the_rate_and_the_tone() {
+        // 44.1 kHz → 48 kHz: a second in gives a second out, the 1 kHz tone intact.
+        let mut r = Resampler::new(44_100.0, RATE);
+        let input: Vec<f32> = (0..44_100).map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 44_100.0).sin()).collect();
+        let mut out = Vec::new();
+        for c in input.chunks(441) {
+            r.push(c, &mut out);
+        }
+        assert!((out.len() as i64 - 48_000).abs() <= 2, "{}", out.len());
+        let worst = out.iter().enumerate().skip(10).map(|(i, &v)| (v - (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0 - 2.0 * std::f32::consts::PI * 1000.0 / 44_100.0).sin()).abs()).fold(0.0, f32::max);
+        assert!(worst < 0.03, "{worst}");
     }
 
     /// Lists playback devices: `cargo test --lib audio_devices -- --ignored --nocapture`

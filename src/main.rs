@@ -40,6 +40,17 @@ fn diagnose() {
     for (uri, description) in qo_all::iio::scan_usb() {
         println!("  USB: {uri} | {description}");
     }
+    println!("librtlsdr: {:?}", qo_all::rtlsdr::library_status());
+    for (i, d) in qo_all::rtlsdr::devices() {
+        println!("  RTL-SDR #{i}: {d}");
+    }
+    println!("libhackrf: {:?}", qo_all::hackrf::library_status());
+    for sn in qo_all::hackrf::devices() {
+        println!("  HackRF: {sn}");
+    }
+    for (name, driver) in qo_all::serial::ports() {
+        println!("  serial: {name} {driver}");
+    }
     for d in qo_all::audio::input_devices() {
         println!("  microphone: {}", d.name);
     }

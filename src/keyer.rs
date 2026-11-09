@@ -124,6 +124,11 @@ pub struct Keyer {
     pub straight: bool,
     pub dit: bool,
     pub dah: bool,
+    /// The same from a key or paddle on a serial port (set apart, so the window does
+    /// not overwrite them).
+    pub ext_straight: bool,
+    pub ext_dit: bool,
+    pub ext_dah: bool,
     /// Text being sent, as units, and how far it is (samples into the current unit).
     text: VecDeque<bool>,
     text_pos: usize,
@@ -147,6 +152,9 @@ impl Keyer {
             straight: false,
             dit: false,
             dah: false,
+            ext_straight: false,
+            ext_dit: false,
+            ext_dah: false,
             text: VecDeque::new(),
             text_pos: 0,
             el_on: 0,
@@ -185,12 +193,24 @@ impl Keyer {
 
     /// Whether anything is keyed or about to be.
     pub fn busy(&self) -> bool {
-        self.straight || self.dit || self.dah || !self.text.is_empty() || self.el_on + self.el_gap > 0 || self.env > 0.0
+        self.straight_in() || self.dit_in() || self.dah_in() || !self.text.is_empty() || self.el_on + self.el_gap > 0 || self.env > 0.0
     }
 
     /// Whether the key is down now (for the sidetone).
     pub fn key_down(&self) -> bool {
         self.env > 0.5
+    }
+
+    fn straight_in(&self) -> bool {
+        self.straight || self.ext_straight
+    }
+
+    fn dit_in(&self) -> bool {
+        self.dit || self.ext_dit
+    }
+
+    fn dah_in(&self) -> bool {
+        self.dah || self.ext_dah
     }
 
     /// Key state for the next sample.
@@ -209,10 +229,10 @@ impl Keyer {
         if self.el_on > 0 {
             self.el_on -= 1;
             // Iambic memory: the other paddle pressed while this element sounds.
-            if self.last_dit && self.dah {
+            if self.last_dit && self.dah_in() {
                 self.dah_mem = true;
             }
-            if !self.last_dit && self.dit {
+            if !self.last_dit && self.dit_in() {
                 self.dit_mem = true;
             }
             return true;
@@ -221,8 +241,8 @@ impl Keyer {
             self.el_gap -= 1;
             return false;
         }
-        let want_dit = self.dit || self.dit_mem;
-        let want_dah = self.dah || self.dah_mem;
+        let want_dit = self.dit_in() || self.dit_mem;
+        let want_dah = self.dah_in() || self.dah_mem;
         let next_dit = match (want_dit, want_dah) {
             (true, true) => Some(!self.last_dit),
             (true, false) => Some(true),
@@ -237,7 +257,7 @@ impl Keyer {
             self.el_gap = unit;
             return true;
         }
-        self.straight
+        self.straight_in()
     }
 
     /// Appends `n` samples of keyed tone (amplitude `drive` × the level).

@@ -23,7 +23,7 @@ cat > "$out/qo-all.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=QO-ALL
-Comment=QO-100 SSB, CW and FT8/FT4 transceiver
+Comment=QO-100 SSB, CW and FT8/FT4 transceiver and receiver
 Exec=qo-all
 Icon=qo-all
 Terminal=false
@@ -41,6 +41,15 @@ QO-ALL for Linux (x86-64, glibc 2.39+: Ubuntu 24.04 or newer, Debian 13, Mint 22
    sudo apt install libiio0 libasound2t64
 
    (On older names: libasound2.) A Pluto on Ethernet needs nothing more.
+   For an RTL-SDR or a HackRF (receive only), their libraries too; they bring the
+   udev rules that let a normal user open them:
+
+   sudo apt install librtlsdr2 libhackrf0
+
+   (librtlsdr0 on older systems such as Debian 12.)
+
+   An RTL-SDR taken by the TV driver (dvb_usb_rtl28xxu) needs it blacklisted:
+   echo blacklist dvb_usb_rtl28xxu | sudo tee /etc/modprobe.d/blacklist-rtl.conf
 
 2. A Pluto on USB: let a normal user open it, then unplug and replug it:
 
@@ -62,6 +71,7 @@ in ~/.config/qo-all/settings.txt, the log in ~/.config/qo-all/qo-all.adi.
 QO-ALL Linux (x86-64, glibc 2.39+: Ubuntu 24.04 ve sonrası, Debian 13, Mint 22)
 
 1. sudo apt install libiio0 libasound2t64
+   (RTL-SDR ve HackRF için ayrıca: sudo apt install librtlsdr2 libhackrf0)
 2. USB'li Pluto için yukarıdaki udev kuralını kopyalayın, cihazı çıkarıp takın.
 3. ./qo-all ile çalıştırın; menüye eklemek için yukarıdaki install komutları.
 EOF

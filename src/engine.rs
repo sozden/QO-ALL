@@ -47,8 +47,64 @@ const TX_EDGE_HZ: f64 = 40e3;
 #[derive(Clone, Debug, PartialEq)]
 pub enum DeviceChoice {
     Simulator,
-    /// A libiio URI such as "ip:192.168.2.1" or "usb:1.5.5".
+    /// A libiio URI such as "ip:192.168.2.1" or "usb:1.5.5" (ADALM-Pluto, LibreSDR and
+    /// other AD936x radios): receive and transmit.
     Iio(String),
+    /// An RTL-SDR on USB, by index: receive only.
+    RtlSdr(u32),
+    /// An RTL-SDR behind an rtl_tcp server, "host[:port]": receive only.
+    RtlTcp(String),
+    /// A HackRF (by serial number, or the first one): receive only.
+    HackRf(Option<String>),
+}
+
+impl DeviceChoice {
+    /// From the text kept in the settings.
+    pub fn parse(text: &str) -> Self {
+        let t = text.trim();
+        if t.is_empty() || t == "simulator" {
+            Self::Simulator
+        } else if let Some(i) = t.strip_prefix("rtlsdr:") {
+            Self::RtlSdr(i.parse().unwrap_or(0))
+        } else if let Some(a) = t.strip_prefix("rtltcp:") {
+            Self::RtlTcp(a.to_string())
+        } else if t == "hackrf" {
+            Self::HackRf(None)
+        } else if let Some(sn) = t.strip_prefix("hackrf:") {
+            Self::HackRf(Some(sn.to_string()))
+        } else {
+            Self::Iio(crate::iio::normalize_uri(t))
+        }
+    }
+
+    /// The text kept in the settings.
+    pub fn setting(&self) -> String {
+        match self {
+            Self::Simulator => "simulator".into(),
+            Self::Iio(u) => u.clone(),
+            Self::RtlSdr(i) => format!("rtlsdr:{i}"),
+            Self::RtlTcp(a) => format!("rtltcp:{a}"),
+            Self::HackRf(None) => "hackrf".into(),
+            Self::HackRf(Some(sn)) => format!("hackrf:{sn}"),
+        }
+    }
+
+    /// Whether the radio can transmit at all (full duplex).
+    pub fn can_transmit(&self) -> bool {
+        matches!(self, Self::Simulator | Self::Iio(_))
+    }
+
+    /// Sample rates the radio is used at (receive and transmit).
+    pub fn rates(&self) -> &'static [f64] {
+        match self {
+            // Ethernet (FIR filters in the radio) and USB.
+            Self::Simulator | Self::Iio(_) => &[0.6e6, 2.4e6],
+            // 1.8 MS/s keeps an rtl_tcp stream under 30 Mbit/s.
+            Self::RtlSdr(_) | Self::RtlTcp(_) => &[1.8e6, 2.4e6],
+            // A HackRF goes no lower than 2 MS/s.
+            Self::HackRf(_) => &[2.4e6],
+        }
+    }
 }
 
 /// Settings that need the station restarted when they change.
@@ -68,6 +124,11 @@ pub struct StationConfig {
     /// Sound devices (None: the system's default).
     pub microphone: Option<String>,
     pub speaker: Option<String>,
+    /// Whether the radio's transmitter is used (off: receive only, whatever the radio).
+    pub tx_enabled: bool,
+    /// The radio's frequency error (ppm, positive when it tunes high): its tuning is
+    /// corrected by it. The beacon lock takes care of what is left.
+    pub ppm: f64,
 }
 
 impl Default for StationConfig {
@@ -81,6 +142,8 @@ impl Default for StationConfig {
             tx_lo_hz: 2_399.9e6,
             microphone: None,
             speaker: None,
+            tx_enabled: true,
+            ppm: 0.0,
         }
     }
 }
@@ -258,8 +321,12 @@ pub struct Engine {
     pub microphone: Result<String, String>,
     pub speaker: Result<String, String>,
     stop: Arc<AtomicBool>,
-    _audio_out: Option<AudioOutput>,
-    _mic: Option<AudioInput>,
+    /// What the speaker plays from and the microphone goes to, kept so the devices can
+    /// be changed while the station runs.
+    audio: AudioBuffer,
+    mic_sink: SyncSender<Vec<f32>>,
+    audio_out: Option<AudioOutput>,
+    mic: Option<AudioInput>,
 }
 
 impl Engine {
@@ -281,8 +348,8 @@ impl Engine {
             }
             Err(e) => (None, Err(e)),
         };
-        let audio_rate = audio_out.as_ref().map_or(48_000.0, |o| o.sample_rate as f64);
-        let listener = Listener::new(ListenSettings { audio_rate, ..listen });
+        // Devices at other rates are resampled to this one.
+        let listener = Listener::new(ListenSettings { audio_rate: audio::RATE, ..listen });
 
         // Consumers of the received blocks.
         let mut consumers = Vec::new();
@@ -291,7 +358,7 @@ impl Engine {
             consumers.push(tx);
             rx
         };
-        listener.spawn(channel(), audio);
+        listener.spawn(channel(), audio.clone());
         let beacon = beacon::spawn(channel(), QO100_BEACON_HZ, config.lnb_lo_hz, 0.0);
         let ft8 = Ft8::new(&crate::ft8::FT8);
         ft8.spawn(channel());
@@ -317,14 +384,14 @@ impl Engine {
 
         // Microphone and transmitter.
         let (mic_tx, mic_rx) = mpsc::sync_channel::<Vec<f32>>(64);
-        let (mic, microphone) = match audio::open_input(config.microphone.as_deref(), mic_tx) {
+        let (mic, microphone) = match audio::open_input(config.microphone.as_deref(), mic_tx.clone()) {
             Ok(input) => {
                 let name = input.name.clone();
                 (Some(input), Ok(name))
             }
             Err(e) => (None, Err(e)),
         };
-        let mic_rate = mic.as_ref().map_or(48_000.0, |m| m.sample_rate as f64);
+        let mic_rate = audio::RATE;
         let digital = Arc::new(Mutex::new(DigitalState::default()));
         let keyer = Arc::new(Mutex::new(crate::keyer::Keyer::new(mic_rate, 20.0)));
         let tx_settings = Arc::new(Mutex::new(tx));
@@ -335,7 +402,8 @@ impl Engine {
                 settings: tx_settings.clone(),
                 status: tx_status.clone(),
                 devices: handoff_rx,
-                mic: mic.is_some().then_some(mic_rx),
+                // Kept even without a microphone: one may be chosen later.
+                mic: Some(mic_rx),
                 mic_rate,
                 listener: listener.clone(),
                 selfcheck: selfcheck.clone(),
@@ -383,9 +451,42 @@ impl Engine {
             microphone,
             speaker,
             stop,
-            _audio_out: audio_out,
-            _mic: mic,
+            audio,
+            mic_sink: mic_tx,
+            audio_out,
+            mic,
         }
+    }
+
+    /// Plays on another speaker (None: the system's default) without stopping anything.
+    pub fn set_speaker(&mut self, id: Option<String>) {
+        self.audio_out = None;
+        match audio::open(id.as_deref(), self.audio.clone(), self.volume.clone()) {
+            Ok(out) => {
+                self.speaker = Ok(out.name.clone());
+                self.audio_out = Some(out);
+            }
+            Err(e) => self.speaker = Err(e),
+        }
+        self.config.speaker = id;
+    }
+
+    /// Records from another microphone (None: the system's default).
+    pub fn set_microphone(&mut self, id: Option<String>) {
+        self.mic = None;
+        match audio::open_input(id.as_deref(), self.mic_sink.clone()) {
+            Ok(input) => {
+                self.microphone = Ok(input.name.clone());
+                self.mic = Some(input);
+            }
+            Err(e) => self.microphone = Err(e),
+        }
+        self.config.microphone = id;
+    }
+
+    /// The parts a serial PTT and key work with.
+    pub fn serial_station(&self) -> crate::serialio::Station {
+        crate::serialio::Station { tx: self.tx.clone(), status: self.tx_status.clone(), keyer: self.keyer.clone() }
     }
 
     pub fn set_gain(&self, gain: Option<f64>) {
@@ -413,9 +514,13 @@ fn open(config: &StationConfig) -> Result<Box<dyn RxDevice>, String> {
     let mut radio: Box<dyn RxDevice> = match &config.device {
         DeviceChoice::Simulator => Box::new(SimRx::new(config.lnb_lo_hz)),
         DeviceChoice::Iio(uri) => Box::new(IioRadio::open(uri)?),
+        DeviceChoice::RtlSdr(i) => Box::new(crate::rtlsdr::RtlUsb::open(*i)?),
+        DeviceChoice::RtlTcp(a) => Box::new(crate::rtlsdr::RtlTcp::open(a)?),
+        DeviceChoice::HackRf(sn) => Box::new(crate::hackrf::HackRf::open(sn.as_deref())?),
     };
     radio.set_sample_rate(config.sample_rate)?;
-    radio.set_frequency(config.center_if())?;
+    // A radio that tunes `ppm` high is asked for that much less.
+    radio.set_frequency(config.center_if() / (1.0 + config.ppm * 1e-6))?;
     radio.set_gain(config.rx_gain)?;
     Ok(radio)
 }
@@ -429,7 +534,7 @@ fn receive(
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
     let mut radio = open(config)?;
-    let tx = radio.transmitter();
+    let tx = if config.tx_enabled { radio.transmitter() } else { Err("TX is off in the settings (receive only)".to_string()) };
     let _ = events.send(Event::Opened { model: radio.model(), tx: tx.as_ref().map(|_| ()).map_err(|e| e.clone()), warning: radio.warning() });
     notify();
     if let Ok(t) = tx {
@@ -890,8 +995,9 @@ mod tests {
         println!("decoded {m:?}");
         assert_eq!(st.digital_started, Some(7));
         assert_eq!(m.slot as f64, slot * 15.0);
-        // The simulated transmitter is off by TX_ERROR_HZ.
-        assert!((m.audio_hz - (1_500.0 + crate::sim::TX_ERROR_HZ)).abs() < 10.0);
+        // The simulated transmitter is off by TX_ERROR_HZ. FT8 resolves 6.25 Hz, and the
+        // simulated LNB drifts on between the beacon reading and the slot: two steps.
+        assert!((m.audio_hz - (1_500.0 + crate::sim::TX_ERROR_HZ)).abs() < 15.0, "{}", m.audio_hz);
     }
 
     /// CW from the keyer comes down on the dial (plus the simulated transmitter error):

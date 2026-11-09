@@ -17,6 +17,8 @@ use qo_all::ft8::{FT4, FT8, Protocol};
 use qo_all::tune;
 use qo_all::vox::{Blocked, TxState, VoxSettings};
 
+use qo_all::serialio::{KeyInput, PttLine, SerialConfig, SerialIo};
+
 use crate::ftpanel::{self, FtPanel};
 use crate::logpanel::{LogPanel, Station};
 use crate::settings::Settings;
@@ -49,7 +51,33 @@ enum DecoderTab {
     Ft8,
     Ft4,
     Cw,
-    Log,
+}
+
+/// The kinds of radio offered in the settings.
+#[derive(Clone, Copy, PartialEq)]
+enum RadioKind {
+    Simulator,
+    Iio,
+    RtlUsb,
+    RtlTcp,
+    HackRf,
+}
+
+impl RadioKind {
+    fn of(d: &DeviceChoice) -> Self {
+        match d {
+            DeviceChoice::Simulator => Self::Simulator,
+            DeviceChoice::Iio(_) => Self::Iio,
+            DeviceChoice::RtlSdr(_) => Self::RtlUsb,
+            DeviceChoice::RtlTcp(_) => Self::RtlTcp,
+            DeviceChoice::HackRf(_) => Self::HackRf,
+        }
+    }
+}
+
+/// The allowed sample rate nearest to `rate`.
+fn fit_rate(device: &DeviceChoice, rate: f64) -> f64 {
+    device.rates().iter().copied().min_by(|a, b| (a - rate).abs().total_cmp(&(b - rate).abs())).unwrap_or(rate)
 }
 
 pub struct App {
@@ -121,14 +149,25 @@ pub struct App {
     ft4_on: bool,
     show_settings: bool,
     /// Settings being edited before they are applied.
-    edit_device_iio: bool,
+    edit_kind: RadioKind,
     edit_uri: String,
+    edit_rtl_index: u32,
+    edit_rtl_tcp: String,
+    edit_hackrf: String,
+    edit_tx_enabled: bool,
+    /// The antenna/SWR warning is open, waiting for an answer.
+    tx_warning: bool,
+    edit_ppm: f64,
+    rtl_found: Vec<(u32, String)>,
+    hackrf_found: Vec<String>,
+    /// PTT out and the CW key in on serial ports, and their settings being edited.
+    serial: SerialIo,
+    edit_serial: SerialConfig,
+    ports: Vec<(String, String)>,
     edit_lnb_mhz: f64,
     edit_gain: f64,
     edit_auto_gain: bool,
     edit_rate: f64,
-    edit_mic: Option<String>,
-    edit_speaker: Option<String>,
     usb_found: Vec<(String, String)>,
     mics: Vec<qo_all::audio::OutputDevice>,
     /// FT8 or FT4 (the receiver then works in USB on the FT dial), and the SSB dial to
@@ -136,9 +175,8 @@ pub struct App {
     digital: Option<&'static Protocol>,
     ssb_dial: f64,
     ft: FtPanel,
-    /// The log window, and whether it is shown in place of the FT contact's messages.
+    /// The log window, always at the bottom.
     log: LogPanel,
-    ft_log_tab: bool,
     edit_call: String,
     edit_grid: String,
     edit_log: String,
@@ -162,25 +200,30 @@ impl App {
                 }
             }
         };
-        let device = match s.text("device") {
-            Some(uri) if uri != "simulator" => DeviceChoice::Iio(iio::normalize_uri(&uri)),
-            _ => DeviceChoice::Simulator,
-        };
+        let device = DeviceChoice::parse(&s.text("device").unwrap_or_default());
         let defaults = StationConfig::default();
         // Ethernet links carry too little for 2.4 MS/s both ways: the low rate there.
         let rate = s.get("sample_rate").unwrap_or(if matches!(device, DeviceChoice::Iio(ref u) if u.starts_with("ip:")) { LOW_RATE } else { 2.4e6 });
-        // Any earlier low rate (1.2 MS/s was too much for an Ethernet link) becomes the
-        // one low rate offered now.
-        let rate = if rate < qo_all::iio::FIR_RATE_LIMIT { LOW_RATE } else { rate };
+        // An earlier rate the radio is no longer used at (1.2 MS/s was too much for an
+        // Ethernet link) becomes the nearest one offered now.
+        let rate = fit_rate(&device, rate);
         let config = StationConfig {
             device,
             lnb_lo_hz: s.get("lnb_lo_hz").unwrap_or(defaults.lnb_lo_hz),
             rx_gain: if s.get("rx_auto_gain").unwrap_or(false) { None } else { Some(s.get("rx_gain").unwrap_or(40.0)) },
             microphone: s.text("microphone"),
             speaker: s.text("speaker"),
+            tx_enabled: s.get("tx_enabled").unwrap_or(true),
+            ppm: s.get("ppm").unwrap_or(0.0),
             ..defaults
         }
         .with_rate(rate);
+        let serial_config = SerialConfig {
+            ptt_port: s.text("ptt_port").unwrap_or_default(),
+            ptt_line: PttLine::from_name(&s.text("ptt_line").unwrap_or_default()),
+            key_port: s.text("key_port").unwrap_or_default(),
+            key_input: KeyInput::from_name(&s.text("key_input").unwrap_or_default()),
+        };
         let logo = qo_all::logo::rgba(96, false);
         let logo = cc.egui_ctx.load_texture("logo", ColorImage::from_rgba_unmultiplied([96, 96], &logo), TextureOptions::LINEAR);
         // LSB is not used on QO-100: a saved LSB becomes USB.
@@ -235,24 +278,41 @@ impl App {
             tab: match s.text("decoder_tab").as_deref() {
                 Some("FT4") => DecoderTab::Ft4,
                 Some("CW") => DecoderTab::Cw,
-                Some("LOG") => DecoderTab::Log,
                 _ => DecoderTab::Ft8,
             },
             ft4_on: s.get("ft4").unwrap_or(false),
             show_settings: false,
-            edit_device_iio: matches!(config.device, DeviceChoice::Iio(_)),
+            edit_kind: RadioKind::of(&config.device),
             edit_uri: match &config.device {
                 DeviceChoice::Iio(u) => u.clone(),
-                DeviceChoice::Simulator => s.text("last_uri").unwrap_or_else(|| "ip:192.168.2.1".into()),
+                _ => s.text("last_uri").unwrap_or_else(|| "ip:192.168.2.1".into()),
             },
+            edit_rtl_index: match config.device {
+                DeviceChoice::RtlSdr(i) => i,
+                _ => 0,
+            },
+            edit_rtl_tcp: match &config.device {
+                DeviceChoice::RtlTcp(a) => a.clone(),
+                _ => s.text("last_rtl_tcp").unwrap_or_default(),
+            },
+            edit_hackrf: match &config.device {
+                DeviceChoice::HackRf(Some(sn)) => sn.clone(),
+                _ => String::new(),
+            },
+            edit_tx_enabled: config.tx_enabled,
+            tx_warning: false,
+            edit_ppm: config.ppm,
+            rtl_found: Vec::new(),
+            hackrf_found: Vec::new(),
+            serial: SerialIo::start(serial_config.clone()),
+            edit_serial: serial_config,
+            ports: Vec::new(),
             edit_lnb_mhz: config.lnb_lo_hz / 1e6,
             edit_gain: config.rx_gain.unwrap_or(40.0),
             edit_auto_gain: config.rx_gain.is_none(),
             edit_rate: config.sample_rate,
-            edit_mic: config.microphone.clone(),
-            edit_speaker: config.speaker.clone(),
             usb_found: Vec::new(),
-            mics: Vec::new(),
+            mics: qo_all::audio::input_devices(),
             // The last mode, FT8/FT4 included.
             digital: match s.text("digital").as_deref() {
                 Some("FT8") => Some(&FT8),
@@ -261,12 +321,11 @@ impl App {
             },
             ssb_dial: s.get("ssb_dial_hz").unwrap_or(rx_dial),
             log: LogPanel::new(s.text("adif_path").map(std::path::PathBuf::from).unwrap_or_else(ftpanel::default_log)),
-            ft_log_tab: s.get("ft_log_tab").unwrap_or(false),
             ft: FtPanel::new(&s),
             edit_call: s.text("my_call").unwrap_or_default(),
             edit_grid: s.text("my_grid").unwrap_or_default(),
             edit_log: s.text("adif_path").unwrap_or_else(|| ftpanel::default_log().display().to_string()),
-            speakers: Vec::new(),
+            speakers: qo_all::audio::output_devices(),
             config,
             engine: None,
             model: None,
@@ -291,6 +350,7 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
+        self.serial.attach(None);
         self.engine = None;
         self.model = None;
         self.tx_capable = None;
@@ -312,6 +372,7 @@ impl App {
         let listen = ListenSettings { dial_hz: 0.0, mode: self.mode, bandwidth_hz: self.mode.default_bandwidth(), audio_rate: 48e3, volume: self.volume };
         let ctx = ctx.clone();
         let engine = Engine::start(self.config.clone(), listen, TxSettings::default(), self.volume, move || ctx.request_repaint());
+        self.serial.attach(Some(engine.serial_station()));
         self.engine = Some(engine);
         self.sync();
     }
@@ -519,14 +580,15 @@ impl App {
     fn save(&mut self) {
         let s = &mut self.settings;
         s.set("lang", if self.lang == Lang::Tr { "tr" } else { "en" });
-        s.set(
-            "device",
-            match &self.config.device {
-                DeviceChoice::Simulator => "simulator".to_string(),
-                DeviceChoice::Iio(u) => u.clone(),
-            },
-        );
+        s.set("device", self.config.device.setting());
         s.set("last_uri", &self.edit_uri);
+        s.set("last_rtl_tcp", &self.edit_rtl_tcp);
+        s.set("tx_enabled", self.config.tx_enabled);
+        s.set("ppm", self.config.ppm);
+        s.set("ptt_port", &self.serial.config.ptt_port);
+        s.set("ptt_line", self.serial.config.ptt_line.name());
+        s.set("key_port", &self.serial.config.key_port);
+        s.set("key_input", self.serial.config.key_input.name());
         s.set("lnb_lo_hz", self.config.lnb_lo_hz);
         s.set("sample_rate", self.config.sample_rate);
         s.set("rx_auto_gain", self.config.rx_gain.is_none());
@@ -564,9 +626,7 @@ impl App {
             DecoderTab::Ft8 => "FT8",
             DecoderTab::Ft4 => "FT4",
             DecoderTab::Cw => "CW",
-            DecoderTab::Log => "LOG",
         });
-        s.set("ft_log_tab", self.ft_log_tab);
         self.ft.save(s);
         s.set("digital", self.digital.map_or("", |p| p.name));
         s.set("ssb_dial_hz", self.ssb_dial);
@@ -631,8 +691,9 @@ impl App {
                 if ui.add(egui::Button::new(RichText::new(self.t("Settings", "Ayarlar")).color(TEXT()))).clicked() {
                     self.show_settings = !self.show_settings;
                     if self.show_settings {
-                        self.mics = qo_all::audio::input_devices();
-                        self.speakers = qo_all::audio::output_devices();
+                        self.ports = qo_all::serial::ports();
+                        // The settings as they are now, not as last left unapplied.
+                        self.edit_serial = self.serial.config.clone();
                     }
                 }
                 // Language: both shown, the one in use marked.
@@ -760,15 +821,36 @@ impl App {
                     self.line.clear();
                 }
             }
+            // Sound devices, changed at once (right to left here).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(self.t(
-                        "Click: listen · Right click: transmit here · Wheel: 10 Hz (Shift 100 Hz)",
-                        "Tık: dinle · Sağ tık: burada yayın · Tekerlek: 10 Hz (Shift 100 Hz)",
-                    ))
-                    .size(11.0)
-                    .color(DIM()),
-                );
+                let default = self.t("System default", "Sistem varsayılanı");
+                let current = self.config.speaker.clone();
+                let (pick, open) = device_combo(ui, "speaker", &self.speakers, &current, default);
+                ui.label(RichText::new(self.t("Speaker", "Hoparlör")).size(12.0).color(MUTED()));
+                if open {
+                    self.speakers = qo_all::audio::output_devices();
+                }
+                if let Some(id) = pick {
+                    self.config.speaker = id.clone();
+                    if let Some(e) = self.engine.as_mut() {
+                        e.set_speaker(id);
+                    }
+                    self.save();
+                }
+                ui.add_space(8.0);
+                let current = self.config.microphone.clone();
+                let (pick, open) = device_combo(ui, "mic", &self.mics, &current, default);
+                ui.label(RichText::new(self.t("Microphone", "Mikrofon")).size(12.0).color(MUTED()));
+                if open {
+                    self.mics = qo_all::audio::input_devices();
+                }
+                if let Some(id) = pick {
+                    self.config.microphone = id.clone();
+                    if let Some(e) = self.engine.as_mut() {
+                        e.set_microphone(id);
+                    }
+                    self.save();
+                }
             });
         });
     }
@@ -861,6 +943,12 @@ impl App {
             painter.text(pos2(tx_x - 5.0, rect.top() + 3.0), Align2::RIGHT_TOP, "TX", FontId::proportional(12.0), TX());
         }
 
+        // How to use it, faintly in the corner.
+        let hint = self.t(
+            "Click: listen · Right click: transmit here · Wheel: 10 Hz (Shift 100 Hz)",
+            "Tık: dinle · Sağ tık: burada yayın · Tekerlek: 10 Hz (Shift 100 Hz)",
+        );
+        painter.text(pos2(rect.right() - 6.0, spec.top() + 4.0), Align2::RIGHT_TOP, hint, FontId::proportional(11.0), DIM());
         // Hover readout.
         if let Some(p) = response.hover_pos() {
             let hz = hz_of(p.x);
@@ -904,7 +992,7 @@ impl App {
 
     fn decoders(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, name) in [(DecoderTab::Ft8, "FT8"), (DecoderTab::Ft4, "FT4"), (DecoderTab::Cw, "CW"), (DecoderTab::Log, "LOG")] {
+            for (tab, name) in [(DecoderTab::Ft8, "FT8"), (DecoderTab::Ft4, "FT4"), (DecoderTab::Cw, "CW")] {
                 if ui::choice(ui, name, self.tab == tab, BLUE()) {
                     self.tab = tab;
                 }
@@ -921,13 +1009,8 @@ impl App {
                 ui.label(RichText::new(text).size(11.0).color(DIM()));
             });
         });
-        if self.tab == DecoderTab::Log {
-            self.log_ui(ui);
-            return;
-        }
         let Some(e) = &self.engine else { return };
         let lines: Vec<String> = match self.tab {
-            DecoderTab::Log => Vec::new(),
             DecoderTab::Ft8 | DecoderTab::Ft4 => {
                 let worker = if self.tab == DecoderTab::Ft8 { &e.ft8 } else { &e.ft4 };
                 let messages = worker.messages();
@@ -1042,6 +1125,14 @@ impl App {
                     self.ptt_latched = false;
                     self.tune = false;
                 }
+            }
+            if let Some(Err(why)) = &self.tx_capable {
+                let text = if !self.config.tx_enabled {
+                    self.t("Receive only: TX is off in the settings", "Yalnızca alıcı: TX ayarlarda kapalı").to_string()
+                } else {
+                    format!("{}: {why}", self.t("Receive only", "Yalnızca alıcı"))
+                };
+                ui.label(RichText::new(text).size(11.0).color(RX()));
             }
             ui.add_space(2.0);
             ui.label(RichText::new(self.t("Output power", "Çıkış gücü")).size(11.0).color(MUTED()));
@@ -1217,20 +1308,7 @@ impl App {
             ui.allocate_ui_with_layout(vec2(qso, h), column, |ui| {
                 ui::card(ui, DEEP(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
-                    // The contact's messages or the log.
-                    ui.horizontal(|ui| {
-                        if ui::choice(ui, "QSO", !self.ft_log_tab, RX()) {
-                            self.ft_log_tab = false;
-                        }
-                        if ui::choice(ui, "LOG", self.ft_log_tab, BLUE()) {
-                            self.ft_log_tab = true;
-                        }
-                    });
-                    if self.ft_log_tab {
-                        self.log_ui(ui);
-                    } else {
-                        self.ft.qso_pane(ui, tr);
-                    }
+                    self.ft.qso_pane(ui, tr);
                 });
             });
             ui.allocate_ui_with_layout(vec2(controls, h), column, |ui| {
@@ -1260,6 +1338,242 @@ impl App {
 
     // ---- Settings -----------------------------------------------------------------
 
+    /// The radio being set up, from the settings' fields.
+    fn edit_device(&self) -> DeviceChoice {
+        match self.edit_kind {
+            RadioKind::Simulator => DeviceChoice::Simulator,
+            RadioKind::Iio => DeviceChoice::Iio(iio::normalize_uri(&self.edit_uri)),
+            RadioKind::RtlUsb => DeviceChoice::RtlSdr(self.edit_rtl_index),
+            RadioKind::RtlTcp => DeviceChoice::RtlTcp(self.edit_rtl_tcp.trim().to_string()),
+            RadioKind::HackRf => {
+                let sn = self.edit_hackrf.trim();
+                DeviceChoice::HackRf((!sn.is_empty()).then(|| sn.to_string()))
+            }
+        }
+    }
+
+    /// The radio: its kind and address, transmitting or not, the sample rate.
+    fn radio_settings(&mut self, ui: &mut egui::Ui) {
+        ui::caption(ui, self.t("RADIO", "CİHAZ"), RX());
+        let kinds = [
+            (RadioKind::Simulator, self.t("Simulator (no radio)", "Simülatör (cihazsız)")),
+            (RadioKind::Iio, self.t("ADALM-Pluto, LibreSDR (AD936x) · RX + TX", "ADALM-Pluto, LibreSDR (AD936x) · RX + TX")),
+            (RadioKind::RtlUsb, self.t("RTL-SDR on USB · RX only", "RTL-SDR, USB · yalnızca RX")),
+            (RadioKind::RtlTcp, self.t("RTL-SDR over the network (rtl_tcp) · RX only", "RTL-SDR, ağ üzerinden (rtl_tcp) · yalnızca RX")),
+            (RadioKind::HackRf, self.t("HackRF One on USB · RX only", "HackRF One, USB · yalnızca RX")),
+        ];
+        for (kind, label) in kinds {
+            ui.radio_value(&mut self.edit_kind, kind, label);
+        }
+        ui.add_space(2.0);
+        let small = |ui: &mut egui::Ui, text: String, color: Color32| {
+            ui.label(RichText::new(text).size(11.0).color(color));
+        };
+        match self.edit_kind {
+            RadioKind::Simulator => {}
+            RadioKind::Iio => {
+                ui.horizontal(|ui| {
+                    ui.label("URI");
+                    ui.text_edit_singleline(&mut self.edit_uri);
+                });
+                if ui.button(self.t("Search USB", "USB'de ara")).clicked() {
+                    self.usb_found = iio::scan_usb();
+                    if self.usb_found.is_empty() {
+                        self.usb_found.push((String::new(), self.t("Nothing found on USB", "USB'de cihaz bulunamadı").into()));
+                    }
+                }
+                for (uri, description) in self.usb_found.clone() {
+                    if !uri.is_empty() && ui.button(format!("{uri} · {description}")).clicked() {
+                        self.edit_uri = uri;
+                    } else if uri.is_empty() {
+                        small(ui, description, MUTED());
+                    }
+                }
+                small(ui, self.t("Network: ip:192.168.2.1 · USB: usb:1.2.5", "Ağ: ip:192.168.2.1 · USB: usb:1.2.5").into(), DIM());
+                if let Err(e) = iio::library_status() {
+                    small(ui, format!("libiio: {e}"), TX());
+                }
+            }
+            RadioKind::RtlUsb => {
+                ui.horizontal(|ui| {
+                    ui.label(self.t("Device no.", "Cihaz no."));
+                    ui.add(egui::DragValue::new(&mut self.edit_rtl_index).range(0..=15));
+                    if ui.button(self.t("Search USB", "USB'de ara")).clicked() {
+                        self.rtl_found = qo_all::rtlsdr::devices();
+                    }
+                });
+                for (i, d) in self.rtl_found.clone() {
+                    if ui.selectable_label(self.edit_rtl_index == i, format!("#{i} · {d}")).clicked() {
+                        self.edit_rtl_index = i;
+                    }
+                }
+                match qo_all::rtlsdr::library_status() {
+                    Err(e) => small(ui, format!("librtlsdr: {e}"), TX()),
+                    Ok(()) if cfg!(windows) => small(ui, self.t("Windows: the dongle needs the WinUSB driver (Zadig)", "Windows: cihaz için WinUSB sürücüsü gerekir (Zadig)").into(), DIM()),
+                    Ok(()) => {}
+                }
+            }
+            RadioKind::RtlTcp => {
+                ui.horizontal(|ui| {
+                    ui.label(self.t("Server", "Sunucu"));
+                    ui.add(egui::TextEdit::singleline(&mut self.edit_rtl_tcp).hint_text("192.168.1.20:1234"));
+                });
+                small(ui, self.t("On the other computer: rtl_tcp -a <its address>", "Diğer bilgisayarda: rtl_tcp -a <adresi>").into(), DIM());
+            }
+            RadioKind::HackRf => {
+                ui.horizontal(|ui| {
+                    ui.label(self.t("Serial no.", "Seri no."));
+                    let hint = self.t("the first one", "ilk bulunan");
+                    ui.add(egui::TextEdit::singleline(&mut self.edit_hackrf).desired_width(150.0).hint_text(hint));
+                    if ui.button(self.t("Search", "Ara")).clicked() {
+                        self.hackrf_found = qo_all::hackrf::devices();
+                    }
+                });
+                for sn in self.hackrf_found.clone() {
+                    if ui.selectable_label(self.edit_hackrf == sn, &sn).clicked() {
+                        self.edit_hackrf = sn;
+                    }
+                }
+                if let Err(e) = qo_all::hackrf::library_status() {
+                    small(ui, format!("libhackrf: {e}"), TX());
+                }
+            }
+        }
+        let device = self.edit_device();
+        // Transmitting: only on radios that can, and only after the warning.
+        if device.can_transmit() {
+            let mut on = self.edit_tx_enabled;
+            let label = self.t("TX enabled (transmit with this radio)", "TX etkin (bu cihazla yayın yap)");
+            let color = if on { TX() } else { TEXT() };
+            if ui.checkbox(&mut on, RichText::new(label).color(color)).changed() {
+                if on {
+                    self.tx_warning = true;
+                } else {
+                    self.edit_tx_enabled = false;
+                }
+            }
+            if !self.edit_tx_enabled {
+                small(ui, self.t("Receive only: the transmitter stays off", "Yalnızca alıcı: verici kapalı kalır").into(), DIM());
+            }
+        }
+        ui.add_space(4.0);
+        ui.label(if device.can_transmit() { self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)") } else { self.t("Sample rate", "Örnekleme hızı") });
+        if !device.rates().contains(&self.edit_rate) {
+            self.edit_rate = fit_rate(&device, if matches!(device, DeviceChoice::Iio(ref u) if u.starts_with("ip:")) { LOW_RATE } else { 2.4e6 });
+        }
+        for &rate in device.rates() {
+            let label = match (&device, rate) {
+                (DeviceChoice::Simulator | DeviceChoice::Iio(_), r) if r < 1e6 => self.t("0.6 MS/s · Ethernet (FIR filter in the radio)", "0.6 MS/s · Ethernet (cihazda FIR filtresi)").to_string(),
+                (DeviceChoice::Simulator | DeviceChoice::Iio(_), _) => "2.4 MS/s · USB".to_string(),
+                (DeviceChoice::RtlSdr(_) | DeviceChoice::RtlTcp(_), r) if r < 2e6 => self.t("1.8 MS/s · for a slower network", "1.8 MS/s · yavaş ağ için").to_string(),
+                (_, r) => format!("{:.1} MS/s", r / 1e6),
+            };
+            ui.radio_value(&mut self.edit_rate, rate, label);
+        }
+    }
+
+    /// Asked before transmitting is allowed: an open output can damage the radio.
+    fn tx_warning_ui(&mut self, ctx: &egui::Context) {
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("tx_warning")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(RichText::new(self.t("Transmit with this radio?", "Bu cihazla yayın yapılsın mı?")).size(17.0).strong().color(TX()));
+            ui.add_space(6.0);
+            ui.label(self.t(
+                "Make sure an antenna (or a dummy load) is connected to the TX output and its SWR is good, and that the amplifier after it is set up. Transmitting into an open or badly matched output can damage the radio and the amplifier.",
+                "TX çıkışına bir anten (ya da yapay yük) bağlı olduğundan, SWR'sinin düzgün olduğundan ve arkasındaki amplifikatörün hazır olduğundan emin olun. Açık ya da uyumsuz bir çıkışa yayın yapmak cihaza ve amplifikatöre zarar verebilir.",
+            ));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new(self.t("Yes, the antenna is connected", "Evet, anten bağlı")).color(BG())).fill(TX())).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button(self.t("Cancel", "Vazgeç")).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(yes) = answer {
+            self.edit_tx_enabled = yes;
+            self.tx_warning = false;
+        }
+    }
+
+    /// PTT out and the CW key in on serial ports.
+    fn serial_settings(&mut self, ui: &mut egui::Ui) {
+        ui::caption(ui, self.t("SERIAL PORTS (PTT, CW KEY)", "SERİ PORTLAR (PTT, CW ANAHTARI)"), TX());
+        let none = self.t("none", "yok");
+        let ports = self.ports.clone();
+        let port_combo = |ui: &mut egui::Ui, salt: &str, value: &mut String| {
+            let text = if value.is_empty() { none.to_string() } else { value.clone() };
+            egui::ComboBox::from_id_salt(salt).width(110.0).selected_text(text).show_ui(ui, |ui| {
+                ui.selectable_value(value, String::new(), none);
+                for (name, driver) in &ports {
+                    let label = if driver.is_empty() { name.clone() } else { format!("{name} · {driver}") };
+                    ui.selectable_value(value, name.clone(), label);
+                }
+            });
+        };
+        egui::Grid::new("serial").num_columns(3).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+            ui.label(self.t("PTT out", "PTT çıkışı"));
+            port_combo(ui, "ptt_port", &mut self.edit_serial.ptt_port);
+            let off = self.t("off", "kapalı");
+            let line_name = |l: PttLine| if l == PttLine::Off { off } else { l.name() };
+            egui::ComboBox::from_id_salt("ptt_line").width(70.0).selected_text(line_name(self.edit_serial.ptt_line)).show_ui(ui, |ui| {
+                for l in PttLine::ALL {
+                    ui.selectable_value(&mut self.edit_serial.ptt_line, l, line_name(l));
+                }
+            });
+            ui.end_row();
+            ui.label(self.t("CW key in", "CW anahtar girişi"));
+            port_combo(ui, "key_port", &mut self.edit_serial.key_port);
+            ui.label("");
+            ui.end_row();
+        });
+        let wiring = |k: KeyInput, tr: bool| match (k, tr) {
+            (KeyInput::Off, false) => "off",
+            (KeyInput::Off, true) => "kapalı",
+            (KeyInput::StraightCts, false) => "Straight key on CTS",
+            (KeyInput::StraightCts, true) => "Düz anahtar CTS'de",
+            (KeyInput::StraightDsr, false) => "Straight key on DSR",
+            (KeyInput::StraightDsr, true) => "Düz anahtar DSR'de",
+            (KeyInput::PaddleDsrCts, false) => "Paddle: dit DSR, dah CTS",
+            (KeyInput::PaddleDsrCts, true) => "Paddle: dit DSR, dah CTS",
+            (KeyInput::PaddleCtsDsr, false) => "Paddle: dit CTS, dah DSR",
+            (KeyInput::PaddleCtsDsr, true) => "Paddle: dit CTS, dah DSR",
+        };
+        let tr = self.lang == Lang::Tr;
+        egui::ComboBox::from_id_salt("key_input").width(220.0).selected_text(wiring(self.edit_serial.key_input, tr)).show_ui(ui, |ui| {
+            for k in KeyInput::ALL {
+                ui.selectable_value(&mut self.edit_serial.key_input, k, wiring(k, tr));
+            }
+        });
+        ui.label(
+            RichText::new(self.t(
+                "PTT goes high while transmitting, in every mode. The key gets its supply from DTR and RTS (held high): wire it between DTR and CTS/DSR. It works in CW with TX enabled.",
+                "PTT her modda yayın boyunca yüksek olur. Anahtar beslemesini DTR ve RTS'den alır (yüksek tutulur): DTR ile CTS/DSR arasına bağlayın. CW'de, TX etkinken çalışır.",
+            ))
+            .size(11.0)
+            .color(DIM()),
+        );
+        if ui.small_button(self.t("Read the ports again", "Portları yeniden oku")).clicked() {
+            self.ports = qo_all::serial::ports();
+        }
+        // What the lines do now.
+        if self.serial.active() {
+            let st = self.serial.state();
+            let mut text = format!("PTT {}", if st.ptt { "●" } else { "○" });
+            if self.serial.config.key_input != KeyInput::Off {
+                let (s, dit, dah) = st.key;
+                text += &format!(" · {} {}{}{}", self.t("key", "anahtar"), if s { "■" } else { "□" }, if dit { " dit" } else { "" }, if dah { " dah" } else { "" });
+            }
+            ui.label(RichText::new(text).size(11.0).color(GOOD()));
+        }
+        for e in &self.serial.errors {
+            ui.label(RichText::new(e).size(11.0).color(TX()));
+        }
+    }
+
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading(self.t("Settings", "Ayarlar"));
@@ -1277,47 +1591,22 @@ impl App {
                 }
             });
             ui.add_space(6.0);
-            ui::caption(ui, self.t("RADIO", "CİHAZ"), RX());
-            let label = self.t("Simulator (no radio)", "Simülatör (cihazsız)");
-            ui.radio_value(&mut self.edit_device_iio, false, label);
-            ui.radio_value(&mut self.edit_device_iio, true, "ADALM-Pluto / AD936x (libiio)");
-            ui.add_enabled_ui(self.edit_device_iio, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("URI");
-                    ui.text_edit_singleline(&mut self.edit_uri);
-                });
-                if ui.button(self.t("Search USB", "USB'de ara")).clicked() {
-                    self.usb_found = iio::scan_usb();
-                    if self.usb_found.is_empty() {
-                        self.usb_found.push((String::new(), self.t("Nothing found on USB", "USB'de cihaz bulunamadı").into()));
-                    }
-                }
-                for (uri, description) in self.usb_found.clone() {
-                    if !uri.is_empty() && ui.button(format!("{uri} · {description}")).clicked() {
-                        self.edit_uri = uri;
-                    } else if uri.is_empty() {
-                        ui.label(RichText::new(description).size(11.0).color(MUTED()));
-                    }
-                }
-                ui.label(
-                    RichText::new(self.t("Network: ip:192.168.2.1 · USB: usb:1.2.5", "Ağ: ip:192.168.2.1 · USB: usb:1.2.5")).size(11.0).color(DIM()),
-                );
-            });
-            if let Err(e) = iio::library_status() {
-                ui.label(RichText::new(format!("libiio: {e}")).size(11.0).color(TX()));
-            }
-            ui.add_space(4.0);
-            ui.label(self.t("Sample rate (receive and transmit)", "Örnekleme hızı (alma ve gönderme)"));
-            let low = self.t("0.6 MS/s · Ethernet (FIR filter in the radio)", "0.6 MS/s · Ethernet (cihazda FIR filtresi)");
-            ui.radio_value(&mut self.edit_rate, LOW_RATE, low);
-            let high = self.t("2.4 MS/s · USB", "2.4 MS/s · USB");
-            ui.radio_value(&mut self.edit_rate, 2.4e6, high);
+            self.radio_settings(ui);
             ui.add_space(8.0);
             ui::caption(ui, self.t("RECEIVER", "ALICI"), RX());
             ui.horizontal(|ui| {
                 ui.label(self.t("LNB LO", "LNB LO"));
                 ui.add(egui::DragValue::new(&mut self.edit_lnb_mhz).speed(0.001).suffix(" MHz").max_decimals(3));
             });
+            ui.horizontal(|ui| {
+                ui.label(self.t("Radio frequency error", "Cihaz frekans hatası"));
+                ui.add(egui::DragValue::new(&mut self.edit_ppm).speed(0.1).range(-200.0..=200.0).suffix(" ppm").max_decimals(1));
+            })
+            .response
+            .on_hover_text(self.t(
+                "For radios without a TCXO (many RTL-SDRs, HackRF): the beacon lock looks only ±15 kHz around where the beacon should be. Positive: the radio tunes high.",
+                "TCXO'suz cihazlar için (çoğu RTL-SDR, HackRF): beacon kilidi beacon'ın olması gereken yerin yalnızca ±15 kHz çevresine bakar. Pozitif: cihaz yüksek ayarlıyor.",
+            ));
             ui.horizontal(|ui| {
                 let label = self.t("Automatic gain", "Otomatik kazanç");
                 ui.checkbox(&mut self.edit_auto_gain, label);
@@ -1392,43 +1681,45 @@ impl App {
             };
             ui.label(RichText::new(cty_state).size(11.0).color(DIM()));
             ui.add_space(8.0);
-            ui::caption(ui, self.t("SOUND", "SES"), GOOD());
-            let default = self.t("System default", "Sistem varsayılanı");
-            let name_of = |list: &[qo_all::audio::OutputDevice], id: &Option<String>| {
-                id.as_ref().and_then(|id| list.iter().find(|d| &d.id == id)).map_or(default.to_string(), |d| d.name.clone())
-            };
-            ui.label(self.t("Microphone", "Mikrofon"));
-            egui::ComboBox::from_id_salt("mic").width(ui.available_width() - 10.0).selected_text(name_of(&self.mics, &self.edit_mic)).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.edit_mic, None, default);
-                for d in &self.mics {
-                    ui.selectable_value(&mut self.edit_mic, Some(d.id.clone()), &d.name);
-                }
-            });
-            ui.label(self.t("Speaker", "Hoparlör"));
-            egui::ComboBox::from_id_salt("speaker")
-                .width(ui.available_width() - 10.0)
-                .selected_text(name_of(&self.speakers, &self.edit_speaker))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.edit_speaker, None, default);
-                    for d in &self.speakers {
-                        ui.selectable_value(&mut self.edit_speaker, Some(d.id.clone()), &d.name);
-                    }
-                });
+            self.serial_settings(ui);
             ui.add_space(12.0);
-            if ui.add(egui::Button::new(RichText::new(self.t("Apply and restart", "Uygula ve yeniden başlat")).color(BG())).fill(RX())).clicked() {
-                self.edit_uri = iio::normalize_uri(&self.edit_uri);
-                self.config.device = if self.edit_device_iio { DeviceChoice::Iio(self.edit_uri.clone()) } else { DeviceChoice::Simulator };
-                self.config.lnb_lo_hz = self.edit_lnb_mhz * 1e6;
-                self.config = self.config.clone().with_rate(self.edit_rate);
-                self.config.rx_gain = (!self.edit_auto_gain).then_some(self.edit_gain);
-                self.config.microphone = self.edit_mic.clone();
-                self.config.speaker = self.edit_speaker.clone();
+            // Only a change of the radio's set-up restarts it; the rest applies at once.
+            let mut config = StationConfig {
+                device: self.edit_device(),
+                lnb_lo_hz: self.edit_lnb_mhz * 1e6,
+                tx_enabled: self.edit_tx_enabled,
+                ppm: self.edit_ppm,
+                ..self.config.clone()
+            }
+            .with_rate(self.edit_rate);
+            config.rx_gain = (!self.edit_auto_gain).then_some(self.edit_gain);
+            let restart = StationConfig { rx_gain: self.config.rx_gain, ..config.clone() } != self.config;
+            let label = if restart { self.t("Apply (restarts the radio)", "Uygula (cihaz yeniden başlar)") } else { self.t("Apply", "Uygula") };
+            if ui.add(egui::Button::new(RichText::new(label).color(BG())).fill(RX())).clicked() {
+                if let DeviceChoice::Iio(u) = &config.device {
+                    self.edit_uri = u.clone();
+                }
+                if !restart
+                    && config.rx_gain != self.config.rx_gain
+                    && let Some(e) = &self.engine
+                {
+                    e.set_gain(config.rx_gain);
+                }
+                self.config = config;
                 self.ft.set_station(&self.edit_call, &self.edit_grid, std::path::PathBuf::from(self.edit_log.trim()));
                 self.log.set_path(self.ft.log_path.clone());
                 let cty = self.edit_cty.trim();
                 self.ft.set_cty((!cty.is_empty()).then(|| std::path::PathBuf::from(cty)));
+                if self.edit_serial != self.serial.config {
+                    // The old ports are let go before the new ones open.
+                    self.serial = SerialIo::start(SerialConfig::default());
+                    self.serial = SerialIo::start(self.edit_serial.clone());
+                    self.serial.attach(self.engine.as_ref().map(|e| e.serial_station()));
+                }
                 self.save();
-                self.start(ui.ctx());
+                if restart {
+                    self.start(ui.ctx());
+                }
                 self.show_settings = false;
             }
             ui.add_space(8.0);
@@ -1455,6 +1746,26 @@ fn offset_control(ui: &mut egui::Ui, name: &str, on: &mut bool, hz: &mut f64, co
         *hz = 0.0;
     }
     *hz = (*hz / 10.0).round() * 10.0;
+}
+
+/// A sound device chooser: the device picked (Some(None) = the system's default), and
+/// whether the list was just opened (to read the devices again).
+fn device_combo(ui: &mut egui::Ui, salt: &str, list: &[qo_all::audio::OutputDevice], current: &Option<String>, default: &str) -> (Option<Option<String>>, bool) {
+    let name = current.as_ref().and_then(|id| list.iter().find(|d| &d.id == id)).map_or(default.to_string(), |d| d.name.clone());
+    let short: String = if name.chars().count() > 26 { name.chars().take(25).chain(['…']).collect() } else { name.clone() };
+    let mut pick = None;
+    let r = egui::ComboBox::from_id_salt(salt).width(190.0).selected_text(RichText::new(short).size(12.0)).show_ui(ui, |ui| {
+        if ui.selectable_label(current.is_none(), default).clicked() {
+            pick = Some(None);
+        }
+        for d in list {
+            if ui.selectable_label(current.as_ref() == Some(&d.id), &d.name).clicked() {
+                pick = Some(Some(d.id.clone()));
+            }
+        }
+    });
+    let r = r.response.on_hover_text(name);
+    (pick.filter(|p| p != current), r.clicked())
 }
 
 fn clock(secs: u64) -> String {
@@ -1498,6 +1809,18 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(CARD()).inner_margin(egui::Margin::same(14)))
                 .show(ui, |ui| self.settings_panel(ui));
         }
+        // The log, always in view under the cards.
+        egui::Panel::bottom("log")
+            .resizable(true)
+            .default_size(170.0)
+            .size_range(110.0..=480.0)
+            .frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 8 }))
+            .show(ui, |ui| {
+                ui::card(ui, DEEP(), |ui| {
+                    ui.set_min_size(vec2(ui.available_width(), ui.available_height()));
+                    self.log_ui(ui);
+                });
+            });
         egui::Panel::bottom("cards")
             .resizable(true)
             .default_size(230.0)
@@ -1540,6 +1863,9 @@ impl eframe::App for App {
                     });
                 });
             });
+        if self.tx_warning {
+            self.tx_warning_ui(ui.ctx());
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin::symmetric(12, 0))).show(ui, |ui| self.spectrum(ui));
     }
 

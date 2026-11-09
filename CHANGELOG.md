@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0 — 2026-11-09
+
+- **Receivers too**: besides the ADALM-Pluto and LibreSDR (AD936x, receive and
+  transmit), an RTL-SDR on USB or over the network (rtl_tcp) and a HackRF One on USB,
+  receive only. A frequency error setting (ppm) for radios without a TCXO.
+- **TX enabled** in the settings: a radio that can transmit is used for it only when
+  ticked, after a warning to check the antenna and its SWR; otherwise receive only.
+- **Serial PTT**: DTR or RTS goes high while transmitting, in every mode (for an
+  amplifier, a sequencer or another radio).
+- **Serial CW key**: a straight key or a paddle on CTS/DSR, supplied from DTR/RTS.
+- **Microphone and speaker on the main screen**, changed at once without restarting.
+- **Settings**: only a change of the radio's set-up restarts it; the rest (gain, station,
+  log, serial ports) applies at once.
+- **The log is always in view** at the bottom of the window; the new/correct form takes
+  two rows.
+
+The 32-bit Windows package has no RTL-SDR/HackRF USB libraries yet: there it works with
+the AD936x radios and with an RTL-SDR over rtl_tcp.
+
 ## 0.5.0 — 2026-11-09
 
 - **Tune in every mode**: the tune button is there in SSB too, a steady 1 kHz tone, to

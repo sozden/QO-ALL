@@ -27,7 +27,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item target\release\qo-all.exe $out
 
 $bin = Join-Path $Pothos "bin"
-foreach ($dll in "libiio.dll", "libusb-1.0.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+foreach ($dll in "libiio.dll", "libusb-1.0.dll", "rtlsdr.dll", "hackrf.dll", "pthreadVC2.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
     Copy-Item (Join-Path $bin $dll) $out
 }
 foreach ($dll in "libxml2.dll", "iconv-2.dll", "liblzma.dll", "zlib1.dll") {

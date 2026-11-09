@@ -6,7 +6,7 @@ Full-duplex SSB, CW and FT8/FT4 transceiver for the narrow-band transponder of t
 (Es'hail-2) geostationary satellite. Listen on 10 GHz and transmit on 2.4 GHz at the same
 time with one ADALM-Pluto (or a similar AD936x radio over Ethernet or USB).
 
-**Status: 0.5.0.** SSB, FT8, the beacon lock and the automatic uplink correction are in
+**Status: 0.6.0.** SSB, FT8, the beacon lock and the automatic uplink correction are in
 use on the air with a Pluto on Ethernet; CW sending is new.
 Windows (64-bit and 32-bit) and Linux (x86-64) packages.
 Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
@@ -58,6 +58,11 @@ narrow-band uplink, never on the beacons.
 - **Log window**: the whole log (date, UTC, call, mode, reports, name, locator), scrolling
   with new contacts; SSB and CW contacts entered by hand into the same ADIF file, and any
   contact corrected with a double click
+- **Radios**: ADALM-Pluto and LibreSDR (AD936x, libiio) to receive and transmit; an
+  RTL-SDR on USB or over the network (rtl_tcp) and a HackRF One, receive only. Transmitting
+  is used only with **TX enabled** ticked in the settings
+- **Serial ports**: PTT out on DTR or RTS, a straight key or a paddle in on CTS/DSR
+- The log always in view at the bottom; microphone and speaker chosen on the main screen
 - Ethernet radios run at 0.6 MS/s with FIR filters in the radio (a Pluto on Ethernet
   takes only about 5 MB/s); USB at 2.4 MS/s
 
@@ -84,7 +89,7 @@ QO-100 (Es'hail-2) uydusunun dar bant transponderi için full duplex SSB ve FT8/
 alıcı-verici. Tek bir ADALM-Pluto (veya Ethernet/USB ile bağlı benzer AD936x cihaz) ile
 10 GHz'de dinlerken aynı anda 2.4 GHz'de yayın yapılır.
 
-**Durum: 0.5.0.** SSB, FT8, beacon kilidi ve otomatik uplink
+**Durum: 0.6.0.** SSB, FT8, beacon kilidi ve otomatik uplink
 düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows (64 ve
 32 bit) ve Linux paketleri [sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında;
 Windows'ta açıp `qo-all.exe`'yi çalıştırmak yeterli, Linux'ta `INSTALL.txt`'ye bakın. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)
@@ -107,3 +112,8 @@ yeşil, çalışılmış istasyonun yeni lokatörü mor, çalışılmışlar sol
 izlenir; SSB ve CW QSO'ları aynı ADIF dosyasına elle girilir, her kayıt çift tıklamayla
 düzeltilir. Tune düğmesi her modda (SSB'de 1 kHz ton).
 Ethernet'te 0.6 MS/s (cihazda FIR filtresi), USB'de 2.4 MS/s.
+**Cihazlar**: alma ve gönderme için ADALM-Pluto ve LibreSDR (AD936x); yalnızca alma için
+USB ya da ağ (rtl_tcp) üzerinden RTL-SDR ve HackRF One. Yayın ancak ayarlarda **TX etkin**
+işaretliyse yapılır (anten/SWR uyarısıyla). **Seri port**: DTR/RTS'den PTT çıkışı,
+CTS/DSR'den düz anahtar ya da paddle girişi. Log her zaman ekranın altında; mikrofon ve
+hoparlör ana ekranda, yeniden başlatmadan değişir.
