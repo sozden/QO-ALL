@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 — 2026-11-09
+
+- **Tune in every mode**: the tune button is there in SSB too, a steady 1 kHz tone, to
+  see where the transmission comes down (in CW on the carrier, in FT8/FT4 in the middle
+  of the chosen audio frequency).
+- **Log window** (LOG tab, and QSO | LOG above the FT8/FT4 contact column): the whole
+  ADIF log with date, UTC, call, mode, reports sent and received, name and locator;
+  follows the file as contacts are added, searchable by call.
+- **Contacts by hand**: SSB and CW contacts entered into the same ADIF log as FT8/FT4
+  (with the satellite fields); a double click on a contact opens it for correction, or
+  deletion. Before the first change the log is kept once beside it (`.adi.bak`).
+- The name of the other operator goes into the log (`NAME`).
+- **Linux** package (x86-64, Ubuntu 24.04 or newer): libiio from the distribution, a udev
+  rule for a Pluto on USB, a menu entry.
+- The chosen decoder tab is remembered.
+
+Windows 32-bit: Analog Devices publishes libiio for 64-bit Windows only, so there is
+no 32-bit package yet.
+
 ## 0.4.0 — 2026-11-08 (first public version)
 
 Everything below in one package; tried on the air with an ADALM-Pluto on Ethernet

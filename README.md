@@ -6,8 +6,9 @@ Full-duplex SSB, CW and FT8/FT4 transceiver for the narrow-band transponder of t
 (Es'hail-2) geostationary satellite. Listen on 10 GHz and transmit on 2.4 GHz at the same
 time with one ADALM-Pluto (or a similar AD936x radio over Ethernet or USB).
 
-**Status: first public version (0.4.0).** SSB, FT8, the beacon lock and the automatic
-uplink correction are in use on the air with a Pluto on Ethernet; CW sending is new.
+**Status: 0.5.0.** SSB, FT8, the beacon lock and the automatic uplink correction are in
+use on the air with a Pluto on Ethernet; CW sending is new.
+Windows (64-bit) and Linux (x86-64) packages.
 Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
 [changelog](CHANGELOG.md) for what is in it and the known issues.
 
@@ -24,6 +25,10 @@ the **simulator** (no radio needed): the transponder with beacons and some users
 drifting LNB, and your own transmission coming back a quarter second later. Choose the
 radio under Settings (e.g. `192.168.2.1`). `qo-all.exe --diagnose 192.168.2.1` prints
 what the program finds without opening the window.
+
+Linux (x86-64, Ubuntu 24.04 / Debian 13 or newer): download
+`QO-ALL-<version>-linux-x64.tar.gz`, `sudo apt install libiio0 libasound2t64`, unpack it
+and run `./qo-all`; `INSTALL.txt` has the udev rule for a Pluto on USB and the menu entry.
 
 Transmitting is off until **TX enabled** is switched on, and stays inside the
 narrow-band uplink, never on the beacons.
@@ -49,6 +54,9 @@ narrow-band uplink, never on the beacons.
   CQ green, a worked station from a new locator purple, worked ones dim, calls to you red;
   the country of each CQ is shown, and a new DXCC entity or grid square can be shown
   and/or sounded as an alert (country file cty.dat taken from WSJT-X or JTDX)
+- **Log window**: the whole log (date, UTC, call, mode, reports, name, locator), scrolling
+  with new contacts; SSB and CW contacts entered by hand into the same ADIF file, and any
+  contact corrected with a double click
 - Ethernet radios run at 0.6 MS/s with FIR filters in the radio (a Pluto on Ethernet
   takes only about 5 MB/s); USB at 2.4 MS/s
 
@@ -75,10 +83,10 @@ QO-100 (Es'hail-2) uydusunun dar bant transponderi için full duplex SSB ve FT8/
 alıcı-verici. Tek bir ADALM-Pluto (veya Ethernet/USB ile bağlı benzer AD936x cihaz) ile
 10 GHz'de dinlerken aynı anda 2.4 GHz'de yayın yapılır.
 
-**Durum: ilk herkese açık sürüm (0.4.0).** SSB, FT8, beacon kilidi ve otomatik uplink
-düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows paketi
-[sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında; açıp `qo-all.exe`'yi
-çalıştırmak yeterli. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)
+**Durum: 0.5.0.** SSB, FT8, beacon kilidi ve otomatik uplink
+düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows (64 bit)
+ve Linux paketleri [sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında;
+Windows'ta açıp `qo-all.exe`'yi çalıştırmak yeterli, Linux'ta `INSTALL.txt`'ye bakın. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)
 bölümüne yazabilirsiniz; ayrıntılar [değişiklikler](CHANGELOG.md) dosyasında.
 
 Program simülatörle açılır; cihaz Ayarlar'dan seçilir (ör. `192.168.2.1`). Yayın
@@ -94,4 +102,7 @@ kulaklık için VOX, PTT, kompresör, çıkış gücü, zaman aşımı, ton; WSJ
 **ADIF loguna** (QO-ALL'ın kendi ya da WSJT-X'in `wsjtx_log.adi` dosyası), LoTW'nin
 istediği uydu alanlarıyla. Çözülen mesajlar loga göre renklenir: yeni istasyonun CQ'su
 yeşil, çalışılmış istasyonun yeni lokatörü mor, çalışılmışlar soluk, size gelenler kırmızı.
+**Log penceresi**: tüm log (tarih, UTC, çağrı, mod, raporlar, isim, lokatör) kayarak
+izlenir; SSB ve CW QSO'ları aynı ADIF dosyasına elle girilir, her kayıt çift tıklamayla
+düzeltilir. Tune düğmesi her modda (SSB'de 1 kHz ton).
 Ethernet'te 0.6 MS/s (cihazda FIR filtresi), USB'de 2.4 MS/s.
