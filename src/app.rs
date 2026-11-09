@@ -18,6 +18,7 @@ use qo_all::tune;
 use qo_all::vox::{Blocked, TxState, VoxSettings};
 
 use crate::ftpanel::{self, FtPanel};
+use crate::logpanel::{LogPanel, Station};
 use crate::settings::Settings;
 use crate::ui::{self, palette::*};
 
@@ -48,6 +49,7 @@ enum DecoderTab {
     Ft8,
     Ft4,
     Cw,
+    Log,
 }
 
 pub struct App {
@@ -134,6 +136,9 @@ pub struct App {
     digital: Option<&'static Protocol>,
     ssb_dial: f64,
     ft: FtPanel,
+    /// The log window, and whether it is shown in place of the FT contact's messages.
+    log: LogPanel,
+    ft_log_tab: bool,
     edit_call: String,
     edit_grid: String,
     edit_log: String,
@@ -227,7 +232,12 @@ impl App {
             waterfall: ColorImage::new([FRAME_POINTS, WATERFALL_ROWS], vec![DEEP(); FRAME_POINTS * WATERFALL_ROWS]),
             waterfall_tex: None,
             logo,
-            tab: DecoderTab::Ft8,
+            tab: match s.text("decoder_tab").as_deref() {
+                Some("FT4") => DecoderTab::Ft4,
+                Some("CW") => DecoderTab::Cw,
+                Some("LOG") => DecoderTab::Log,
+                _ => DecoderTab::Ft8,
+            },
             ft4_on: s.get("ft4").unwrap_or(false),
             show_settings: false,
             edit_device_iio: matches!(config.device, DeviceChoice::Iio(_)),
@@ -250,6 +260,8 @@ impl App {
                 _ => None,
             },
             ssb_dial: s.get("ssb_dial_hz").unwrap_or(rx_dial),
+            log: LogPanel::new(s.text("adif_path").map(std::path::PathBuf::from).unwrap_or_else(ftpanel::default_log)),
+            ft_log_tab: s.get("ft_log_tab").unwrap_or(false),
             ft: FtPanel::new(&s),
             edit_call: s.text("my_call").unwrap_or_default(),
             edit_grid: s.text("my_grid").unwrap_or_default(),
@@ -408,6 +420,13 @@ impl App {
             tx.cw = self.mode == Mode::Cw && self.digital.is_none();
             tx.drive = self.drive;
             tx.tune = self.tune && tx.armed;
+            // The tune tone goes where the mode's signal goes: 1 kHz above the dial in SSB,
+            // the middle of the FT tones, the CW carrier (the modulator sits below it).
+            tx.tune_hz = match self.digital {
+                Some(p) => self.ft.audio_hz + FtPanel::signal_width(p) / 2.0,
+                None if self.mode == Mode::Cw => qo_all::keyer::TONE_HZ,
+                None => 1_000.0,
+            };
             tx.band = self.tx_band();
             tx.digital = self.digital.is_some();
             tx.time_out = Duration::from_secs(self.time_out_s as u64);
@@ -541,6 +560,13 @@ impl App {
         s.set("muted", self.muted);
         s.set("zoom", self.zoom);
         s.set("ft4", self.ft4_on);
+        s.set("decoder_tab", match self.tab {
+            DecoderTab::Ft8 => "FT8",
+            DecoderTab::Ft4 => "FT4",
+            DecoderTab::Cw => "CW",
+            DecoderTab::Log => "LOG",
+        });
+        s.set("ft_log_tab", self.ft_log_tab);
         self.ft.save(s);
         s.set("digital", self.digital.map_or("", |p| p.name));
         s.set("ssb_dial_hz", self.ssb_dial);
@@ -878,7 +904,7 @@ impl App {
 
     fn decoders(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, name) in [(DecoderTab::Ft8, "FT8"), (DecoderTab::Ft4, "FT4"), (DecoderTab::Cw, "CW")] {
+            for (tab, name) in [(DecoderTab::Ft8, "FT8"), (DecoderTab::Ft4, "FT4"), (DecoderTab::Cw, "CW"), (DecoderTab::Log, "LOG")] {
                 if ui::choice(ui, name, self.tab == tab, BLUE()) {
                     self.tab = tab;
                 }
@@ -895,8 +921,13 @@ impl App {
                 ui.label(RichText::new(text).size(11.0).color(DIM()));
             });
         });
+        if self.tab == DecoderTab::Log {
+            self.log_ui(ui);
+            return;
+        }
         let Some(e) = &self.engine else { return };
         let lines: Vec<String> = match self.tab {
+            DecoderTab::Log => Vec::new(),
             DecoderTab::Ft8 | DecoderTab::Ft4 => {
                 let worker = if self.tab == DecoderTab::Ft8 { &e.ft8 } else { &e.ft4 };
                 let messages = worker.messages();
@@ -915,10 +946,9 @@ impl App {
             }
             DecoderTab::Cw => match (self.mode, e.listener.cw()) {
                 (Mode::Cw, Some(cw)) => {
-                    let mut text = cw.text.clone();
-                    if text.len() > 600 {
-                        text = text[text.len() - 600..].to_string();
-                    }
+                    // The last 600 characters (by character: Turkish letters are wider).
+                    let count = cw.text.chars().count();
+                    let text: String = cw.text.chars().skip(count.saturating_sub(600)).collect();
                     vec![format!("{:.0} WPM {}", cw.wpm, if cw.key_down { "■" } else { "" }), text]
                 }
                 _ => vec![self.t("Switch to CW and click a CW signal.", "CW'ye geçip bir CW sinyaline tıklayın.").to_string()],
@@ -929,6 +959,22 @@ impl App {
                 ui.label(RichText::new(l).monospace().size(12.0).color(TEXT()));
             }
         });
+    }
+
+    /// The log window, with what a new contact is logged with.
+    fn log_ui(&mut self, ui: &mut egui::Ui) {
+        let mode = match self.digital {
+            Some(p) => p.name,
+            None if self.mode == Mode::Cw => "CW",
+            None => "SSB",
+        };
+        let (my_call, my_grid) = (self.ft.seq.my_call.clone(), self.ft.seq.my_grid.clone());
+        let st = Station { my_call: &my_call, my_grid: &my_grid, mode, tx_hz: self.uplink(), rx_hz: self.rx_listen() };
+        let tr = self.lang == Lang::Tr;
+        self.log.ui(ui, &st, tr);
+        if std::mem::take(&mut self.log.changed) {
+            self.ft.reload_worked();
+        }
     }
 
     fn sound(&mut self, ui: &mut egui::Ui) {
@@ -1013,13 +1059,18 @@ impl App {
             }
             ui.add_space(2.0);
             let on = status.state == TxState::Transmit;
-            // In FT8/FT4 the sequence keys the transmitter, in CW the keyer: no PTT, no
-            // tune tone.
+            // Tune in every mode: a steady tone where the signal will be, to find it on
+            // the waterfall and set the power.
+            let tip = match self.digital {
+                Some(_) => self.t("A steady tone on the FT transmit frequency", "FT gönderme frekansında sabit bir ton"),
+                None if self.mode == Mode::Cw => self.t("A steady carrier on the dial", "Dinleme frekansında sabit bir taşıyıcı"),
+                None => self.t("A steady tone 1 kHz above the dial", "Dinleme frekansının 1 kHz üstünde sabit bir ton"),
+            };
+            if ui::choice_response(ui, "Tune", self.tune, TX()).on_hover_text(tip).clicked() && can && self.armed {
+                self.tune = !self.tune;
+            }
+            // In FT8/FT4 the sequence keys the transmitter, in CW the keyer: no PTT.
             if self.digital.is_none() && self.mode != Mode::Cw {
-                let tune_text = self.t("Tune 1 kHz", "Ton 1 kHz");
-                if ui::choice(ui, tune_text, self.tune, TX()) && can && self.armed {
-                    self.tune = !self.tune;
-                }
                 if ui::ptt_button(ui, self.ptt_latched || on, can && self.armed) && can && self.armed {
                     self.ptt_latched = !self.ptt_latched;
                 }
@@ -1166,7 +1217,20 @@ impl App {
             ui.allocate_ui_with_layout(vec2(qso, h), column, |ui| {
                 ui::card(ui, DEEP(), |ui| {
                     ui.set_min_size(vec2(ui.available_width(), h - 18.0));
-                    self.ft.qso_pane(ui, tr);
+                    // The contact's messages or the log.
+                    ui.horizontal(|ui| {
+                        if ui::choice(ui, "QSO", !self.ft_log_tab, RX()) {
+                            self.ft_log_tab = false;
+                        }
+                        if ui::choice(ui, "LOG", self.ft_log_tab, BLUE()) {
+                            self.ft_log_tab = true;
+                        }
+                    });
+                    if self.ft_log_tab {
+                        self.log_ui(ui);
+                    } else {
+                        self.ft.qso_pane(ui, tr);
+                    }
                 });
             });
             ui.allocate_ui_with_layout(vec2(controls, h), column, |ui| {
@@ -1360,6 +1424,7 @@ impl App {
                 self.config.microphone = self.edit_mic.clone();
                 self.config.speaker = self.edit_speaker.clone();
                 self.ft.set_station(&self.edit_call, &self.edit_grid, std::path::PathBuf::from(self.edit_log.trim()));
+                self.log.set_path(self.ft.log_path.clone());
                 let cty = self.edit_cty.trim();
                 self.ft.set_cty((!cty.is_empty()).then(|| std::path::PathBuf::from(cty)));
                 self.save();

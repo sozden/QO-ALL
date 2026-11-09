@@ -4,6 +4,7 @@
 
 mod app;
 mod ftpanel;
+mod logpanel;
 mod settings;
 mod ui;
 

@@ -212,6 +212,13 @@ impl FtPanel {
     }
 
     /// New station details or log file (from the settings).
+    /// The log changed elsewhere (entered or corrected by hand): the worked stations
+    /// are read again.
+    pub fn reload_worked(&mut self) {
+        self.worked = Worked::load(&self.log_path);
+        self.count_entities();
+    }
+
     pub fn set_station(&mut self, call: &str, grid: &str, log: PathBuf) {
         let max = self.seq.max_repeats;
         self.seq = Sequencer::new(call, grid);
@@ -352,6 +359,7 @@ impl FtPanel {
                 rx_hz: dial + self.audio_hz,
                 my_call: self.seq.my_call.clone(),
                 my_grid: self.seq.my_grid.clone(),
+                name: None,
             };
             match adif::append(&self.log_path, &c) {
                 Ok(()) => {

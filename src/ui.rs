@@ -51,7 +51,8 @@ pub fn apply_theme(ctx: &egui::Context) {
         let mut v = if light() { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = BG();
         v.window_fill = CARD();
-        v.extreme_bg_color = DEEP();
+        // Text boxes a shade apart from the cards they sit on.
+        v.extreme_bg_color = RAISED();
         v.faint_bg_color = CARD();
         v.window_corner_radius = CornerRadius::same(10);
         v.window_stroke = Stroke::new(1.0, BORDER());
@@ -112,9 +113,14 @@ pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32
 
 /// A toggle shown as a pill; returns true when clicked.
 pub fn choice(ui: &mut egui::Ui, text: &str, on: bool, color: Color32) -> bool {
+    choice_response(ui, text, on, color).clicked()
+}
+
+/// `choice`, with the whole response (for a hover text).
+pub fn choice_response(ui: &mut egui::Ui, text: &str, on: bool, color: Color32) -> egui::Response {
     let (fg, bg) = if on { (color, color.gamma_multiply(0.22)) } else { (MUTED(), RAISED()) };
     let button = egui::Button::new(RichText::new(text).size(12.0).color(fg)).fill(bg).corner_radius(10);
-    ui.add(button).clicked()
+    ui.add(button)
 }
 
 /// Display characters of a frequency at 10 Hz resolution, "10 489.725 00", with the

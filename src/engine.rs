@@ -146,6 +146,9 @@ pub struct TxSettings {
     /// Sends a steady 1 kHz tone instead of the microphone (setting the power, finding
     /// one's own signal on the waterfall).
     pub tune: bool,
+    /// Audio pitch of the tune tone (Hz above the modulator's carrier): where the
+    /// signal of the mode goes (1 kHz up in SSB, the FT tones' place, the CW carrier).
+    pub tune_hz: f64,
     /// FT8/FT4: the transmitter sends the scheduled digital jobs, not the microphone.
     pub digital: bool,
     /// CW: the keyer keys the transmitter.
@@ -170,6 +173,7 @@ impl Default for TxSettings {
             armed: false,
             ptt: false,
             tune: false,
+            tune_hz: TUNE_HZ,
             digital: false,
             cw: false,
             drive: 1.0,
@@ -569,9 +573,10 @@ fn transmit(link: TxLink) {
         // below the dial, so the CW carrier lands on the dial.
         let offset = s.uplink_hz - link.tx_lo_hz - if s.cw && !s.digital { crate::keyer::TONE_HZ } else { 0.0 };
         let band = if offset.abs() > link.rate / 2.0 - TX_EDGE_HZ { Err(Refusal::OutsideTransponder) } else { s.band };
-        // FT8/FT4: the scheduled audio instead of the microphone.
+        // FT8/FT4: the scheduled audio instead of the microphone (the tune tone goes
+        // before it).
         let mut digital_on = false;
-        if s.digital {
+        if s.digital && !s.tune {
             pending.clear();
             let mut d = link.digital.lock().unwrap();
             if std::mem::take(&mut d.halt) {
@@ -605,7 +610,7 @@ fn transmit(link: TxLink) {
         }
         // CW: the keyer's tone instead of the microphone.
         let mut cw_on = false;
-        if s.cw && !s.digital {
+        if s.cw && !s.digital && !s.tune {
             pending.clear();
             let mut k = link.keyer.lock().unwrap();
             if k.busy() {
@@ -619,7 +624,10 @@ fn transmit(link: TxLink) {
         } else {
             link.listener.set_sidetone(false);
         }
-        let keyed = if s.digital {
+        // The tune tone keys the transmitter in every mode.
+        let keyed = if s.tune {
+            true
+        } else if s.digital {
             digital_on
         } else if s.cw {
             cw_on
@@ -631,10 +639,12 @@ fn transmit(link: TxLink) {
             // The tone replaces the microphone.
             pending.clear();
             let n = (link.mic_rate * TUNE_CHUNK_S) as usize;
-            let step = 2.0 * std::f64::consts::PI * TUNE_HZ / link.mic_rate;
+            let step = 2.0 * std::f64::consts::PI * s.tune_hz / link.mic_rate;
+            // In CW the drive sets the level here (digital audio gets it in the modulator).
+            let level = TUNE_LEVEL * if s.cw && !s.digital { s.drive } else { 1.0 };
             pending.extend((0..n).map(|_| {
                 tune_phase = (tune_phase + step) % (2.0 * std::f64::consts::PI);
-                TUNE_LEVEL * tune_phase.sin() as f32
+                level * tune_phase.sin() as f32
             }));
         }
 

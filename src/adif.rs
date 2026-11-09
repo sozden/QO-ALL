@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A contact to log.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +22,8 @@ pub struct Contact {
     pub rx_hz: f64,
     pub my_call: String,
     pub my_grid: String,
+    /// The other operator's name, if given.
+    pub name: Option<String>,
 }
 
 fn field(name: &str, value: &str) -> String {
@@ -53,6 +55,9 @@ pub fn record(c: &Contact) -> String {
     r += &field("CALL", &c.call);
     if let Some(g) = &c.grid {
         r += &field("GRIDSQUARE", g);
+    }
+    if let Some(n) = c.name.as_ref().filter(|n| !n.trim().is_empty()) {
+        r += &field("NAME", n.trim());
     }
     match c.mode.as_str() {
         "FT4" => {
@@ -91,6 +96,138 @@ pub fn append(path: &Path, c: &Contact) -> Result<(), String> {
         text += &format!("QO-ALL ADIF log\n{}{}<EOH>\n", field("ADIF_VER", "3.1.4"), field("PROGRAMID", "QO-ALL"));
     }
     text += &record(c);
+    f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// One record, its fields in their order (names in upper case).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Record(pub Vec<(String, String)>);
+
+impl Record {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+
+    /// Sets a field (an empty value removes it); a new field goes at the end.
+    pub fn set(&mut self, name: &str, value: &str) {
+        let value = value.trim();
+        match self.0.iter().position(|(n, _)| n == name) {
+            Some(i) if value.is_empty() => {
+                self.0.remove(i);
+            }
+            Some(i) => self.0[i].1 = value.to_string(),
+            None if value.is_empty() => {}
+            None => self.0.push((name.to_string(), value.to_string())),
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let mut r: String = self.0.iter().map(|(n, v)| field(n, v)).collect();
+        r += "<EOR>\n";
+        r
+    }
+
+    /// "FT8", "FT4" (MFSK/FT4), "SSB", "CW"...
+    pub fn mode(&self) -> String {
+        match (self.get("MODE"), self.get("SUBMODE")) {
+            (Some("MFSK"), Some(sub)) => sub.to_string(),
+            (Some(m), _) => m.to_string(),
+            (None, _) => String::new(),
+        }
+    }
+}
+
+/// A whole ADIF file: its header kept as it was, and its records.
+#[derive(Clone, Debug, Default)]
+pub struct Log {
+    pub header: String,
+    pub records: Vec<Record>,
+}
+
+impl Log {
+    pub fn parse(text: &str) -> Self {
+        let (header, body) = match text.to_ascii_uppercase().find("<EOH>") {
+            Some(i) => (text[..i + 5].to_string(), &text[i + 5..]),
+            None => (String::new(), text),
+        };
+        let mut records = Vec::new();
+        let mut current = Vec::new();
+        let mut rest = body;
+        while let Some(open) = rest.find('<') {
+            let Some(close) = rest[open..].find('>') else { break };
+            let tag = &rest[open + 1..open + close];
+            rest = &rest[open + close + 1..];
+            let mut parts = tag.split(':');
+            let name = parts.next().unwrap_or_default().trim().to_ascii_uppercase();
+            if name == "EOR" {
+                records.push(Record(std::mem::take(&mut current)));
+                continue;
+            }
+            let Some(len) = parts.next().and_then(|l| l.trim().parse::<usize>().ok()) else { continue };
+            let mut end = len.min(rest.len());
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            current.push((name, rest[..end].to_string()));
+            rest = &rest[end..];
+        }
+        Self { header, records }
+    }
+
+    /// The log of a file; an empty one if there is none yet.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Self::parse(&String::from_utf8_lossy(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let header = if self.header.is_empty() {
+            format!("QO-ALL ADIF log\n{}{}<EOH>", field("ADIF_VER", "3.1.4"), field("PROGRAMID", "QO-ALL"))
+        } else {
+            self.header.clone()
+        };
+        let mut out = header + "\n";
+        for r in &self.records {
+            out += &r.text();
+        }
+        out
+    }
+
+    /// Writes the log back. The file as it was is kept once beside it (".bak") before
+    /// the first change of a run; the new one goes in through a temporary file, so a
+    /// failure never leaves half a log.
+    pub fn save(&self, path: &Path, keep_backup: bool) -> Result<(), String> {
+        let err = |e: std::io::Error| format!("{}: {e}", path.display());
+        if keep_backup && path.is_file() {
+            let mut bak = path.as_os_str().to_owned();
+            bak.push(".bak");
+            std::fs::copy(path, PathBuf::from(bak)).map_err(err)?;
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, self.text()).map_err(err)?;
+        std::fs::rename(&tmp, path).map_err(err)
+    }
+}
+
+/// Appends a record; a new (or empty) file gets an ADIF header first.
+pub fn append_record(path: &Path, r: &Record) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut text = String::new();
+    if fresh {
+        text += &format!("QO-ALL ADIF log
+{}{}<EOH>
+", field("ADIF_VER", "3.1.4"), field("PROGRAMID", "QO-ALL"));
+    }
+    text += &r.text();
     f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -216,6 +353,7 @@ mod tests {
             rx_hz: 10_489.541_5e6,
             my_call: "TA4SO".into(),
             my_grid: "KM46".into(),
+            name: None,
         }
     }
 
@@ -259,6 +397,40 @@ mod tests {
         assert!(w.grid_worked("jo62") && !w.grid_worked("JN88"));
         assert_eq!(w.calls().count(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_edits_keep_the_rest() {
+        let text = "WSJT-X ADIF Export<eoh>\n<call:5>SP9UNU <gridsquare:4>JO90 <mode:3>FT8 <app_x:3>abc <eor>\n<call:6>DL1ABC <mode:3>SSB <rst_sent:2>59 <eor>\n";
+        let mut log = Log::parse(text);
+        assert_eq!(log.header, "WSJT-X ADIF Export<eoh>");
+        assert_eq!(log.records.len(), 2);
+        assert_eq!(log.records[0].mode(), "FT8");
+        log.records[1].set("NAME", "Hans");
+        log.records[1].set("RST_SENT", "57");
+        log.records[0].set("GRIDSQUARE", "");
+        let again = Log::parse(&log.text());
+        assert_eq!(again.records[1].get("NAME"), Some("Hans"));
+        assert_eq!(again.records[1].get("RST_SENT"), Some("57"));
+        assert_eq!(again.records[0].get("GRIDSQUARE"), None);
+        assert_eq!(again.records[0].get("APP_X"), Some("abc"), "unknown fields stay");
+        assert!(again.text().starts_with("WSJT-X ADIF Export<eoh>"));
+        // Written through a temporary file, with a backup of the old one.
+        let dir = std::env::temp_dir().join(format!("qoall-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.adi");
+        std::fs::write(&path, text).unwrap();
+        log.save(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("log.adi.bak")).unwrap(), text);
+        assert_eq!(Log::load(&path).unwrap().records[1].get("NAME"), Some("Hans"));
+        assert!(Log::load(&dir.join("none.adi")).unwrap().records.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn name_goes_into_the_record() {
+        let r = record(&Contact { mode: "SSB".into(), name: Some("Hans".into()), ..contact() });
+        assert!(r.contains("<NAME:4>Hans") && r.contains("<MODE:3>SSB"));
     }
 
     #[test]
