@@ -12,9 +12,9 @@ Windows (64-bit and 32-bit) and Linux (x86-64) packages.
 Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
 [changelog](CHANGELOG.md) for what is in it and the known issues.
 
-![Night theme, FT8](docs/screenshot-night.webp)
+![Night theme: S-meter, band plan, FT8 decodes, log](docs/screenshot-night.webp)
 
-![Paper theme, SSB](docs/screenshot-paper.webp)
+![Paper theme: S-meter, band plan, FT8 decodes, log](docs/screenshot-paper.webp)
 
 ## Trying it
 
