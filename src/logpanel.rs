@@ -380,25 +380,34 @@ impl LogPanel {
         };
         ui::caption(ui, title, GOOD());
         // Two rows, so it fits the log's strip at the bottom of the window.
-        egui::Grid::new("log_form").num_columns(8).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+        // Large fields with a large font: easy to type into during a QSO.
+        egui::Grid::new("log_form").num_columns(8).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
             let field = |ui: &mut egui::Ui, label: &str, value: &mut String, w: f32| {
-                ui.label(RichText::new(label).size(12.0).color(MUTED()));
-                ui.add(egui::TextEdit::singleline(value).desired_width(w));
+                ui.label(RichText::new(label).size(14.0).color(MUTED()));
+                // Fixed size: an empty field in a grid would otherwise shrink.
+                ui.add_sized(
+                    vec2(w, 34.0),
+                    egui::TextEdit::singleline(value).font(egui::FontId::proportional(18.0)).margin(vec2(8.0, 6.0)).desired_width(w),
+                );
             };
-            field(ui, t("Call", "Çağrı"), &mut form.call, 110.0);
-            field(ui, t("Name", "İsim"), &mut form.name, 130.0);
-            field(ui, t("Date", "Tarih"), &mut form.date, 100.0);
-            field(ui, "UTC", &mut form.time, 60.0);
+            field(ui, t("Call", "Çağrı"), &mut form.call, 190.0);
+            field(ui, t("Name", "İsim"), &mut form.name, 230.0);
+            field(ui, t("Date", "Tarih"), &mut form.date, 150.0);
+            field(ui, "UTC", &mut form.time, 100.0);
             ui.end_row();
-            field(ui, t("Sent", "Verilen"), &mut form.sent, 60.0);
-            field(ui, t("Rcvd", "Alınan"), &mut form.rcvd, 60.0);
-            ui.label(RichText::new(t("Mode", "Mod")).size(12.0).color(MUTED()));
-            egui::ComboBox::from_id_salt("log_mode").selected_text(&form.mode).width(80.0).show_ui(ui, |ui| {
-                for m in ["SSB", "CW", "FT8", "FT4"] {
-                    ui.selectable_value(&mut form.mode, m.to_string(), m);
-                }
-            });
-            field(ui, t("Locator", "Lokatör"), &mut form.grid, 60.0);
+            field(ui, t("Sent", "Verilen"), &mut form.sent, 190.0);
+            field(ui, t("Rcvd", "Alınan"), &mut form.rcvd, 230.0);
+            ui.label(RichText::new(t("Mode", "Mod")).size(14.0).color(MUTED()));
+            egui::ComboBox::from_id_salt("log_mode")
+                .selected_text(RichText::new(&form.mode).size(18.0))
+                .width(150.0)
+                .height(240.0)
+                .show_ui(ui, |ui| {
+                    for m in ["SSB", "CW", "FT8", "FT4"] {
+                        ui.selectable_value(&mut form.mode, m.to_string(), RichText::new(m).size(16.0));
+                    }
+                });
+            field(ui, t("Locator", "Lokatör"), &mut form.grid, 100.0);
             ui.end_row();
         });
         ui.add_space(4.0);

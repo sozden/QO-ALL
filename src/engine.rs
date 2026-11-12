@@ -280,6 +280,9 @@ pub struct DigitalJob {
     pub start_utc: f64,
     /// Starting later than this after `start_utc` is no use: the job is dropped (s).
     pub max_late_s: f64,
+    /// Started up to this late, the whole message goes out; later, its beginning is
+    /// left out to keep the slot's timing (s).
+    pub whole_within_s: f64,
     /// Audio at the microphone's rate.
     pub audio: Arc<Vec<f32>>,
 }
@@ -693,11 +696,16 @@ fn transmit(link: TxLink) {
                 && now_utc() >= job.start_utc
             {
                 let job = d.job.take().expect("job");
-                if now_utc() - job.start_utc > job.max_late_s {
+                let late = now_utc() - job.start_utc;
+                if late > job.max_late_s {
                     digital_missed = Some(job.id);
                 } else {
                     digital_started = Some(job.id);
-                    feed = Some((job.id, job.audio, 0));
+                    // Started well into the slot (as WSJT-X does when Tx is enabled late):
+                    // the part of the message that should have gone already is left out,
+                    // so the rest stays on the slot's timing.
+                    let skip = if late > job.whole_within_s { ((late * link.mic_rate) as usize).min(job.audio.len()) } else { 0 };
+                    feed = Some((job.id, job.audio, skip));
                 }
             }
             drop(d);
@@ -981,7 +989,7 @@ mod tests {
         let text = "CQ TA4SO KM46";
         let audio = encode::waveform(&FT8, &encode::tones(&FT8, text).unwrap(), 1_500.0, engine.mic_rate, 0.9);
         let slot = (now_utc() / 15.0).floor() + 1.0;
-        engine.digital.lock().unwrap().job = Some(DigitalJob { id: 7, start_utc: slot * 15.0 + 0.5, max_late_s: 1.0, audio: Arc::new(audio) });
+        engine.digital.lock().unwrap().job = Some(DigitalJob { id: 7, start_utc: slot * 15.0 + 0.5, max_late_s: 1.0, whole_within_s: 1.0, audio: Arc::new(audio) });
         println!("transmitting in slot {slot}, {:.1} s from now", slot * 15.0 + 0.5 - now_utc());
         let deadline = Instant::now() + Duration::from_secs(40);
         let mut found = None;

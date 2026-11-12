@@ -384,10 +384,14 @@ impl FtPanel {
         let slot_s = p.slot_s;
         let cur = (now / slot_s).floor() as u64;
         let into = now - cur as f64 * slot_s;
-        let max_late = if std::ptr::eq(p, &FT8) { 1.0 } else { 0.5 };
+        // As in WSJT-X, a call picked (or an answer due) in the own slot goes out at once,
+        // its beginning cut so the rest keeps the slot's timing. Up to about a third of
+        // the message can be missing and it still decodes at the other end (FT8: 4.5 of
+        // 12.6 s, FT4: 1.8 of 5 s); later than that the next own slot is used.
+        let (whole, max_late) = if std::ptr::eq(p, &FT8) { (1.0, 4.5) } else { (0.5, 1.8) };
         let odd = |n: u64| n % 2 == 1;
         let mut target = cur;
-        if !(odd(cur) == self.seq.tx_odd && into < 0.5 + max_late && self.last_tx_slot != Some(cur)) {
+        if !(odd(cur) == self.seq.tx_odd && into < 0.5 + max_late - 0.2 && self.last_tx_slot != Some(cur)) {
             target = cur + 1;
             if odd(target) != self.seq.tx_odd {
                 target += 1;
@@ -422,7 +426,7 @@ impl FtPanel {
         let id = self.next_id;
         self.next_id += 1;
         let start_utc = target as f64 * slot_s + 0.5;
-        e.digital.lock().unwrap().job = Some(DigitalJob { id, start_utc, max_late_s: max_late, audio });
+        e.digital.lock().unwrap().job = Some(DigitalJob { id, start_utc, max_late_s: max_late, whole_within_s: whole, audio });
         self.scheduled = Some(Scheduled { id, slot: target, text, step: self.seq.next, start_utc });
     }
 

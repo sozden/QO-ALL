@@ -49,19 +49,48 @@ pub fn check(low_hz: f64, high_hz: f64) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Usual activity in a part of the transponder (IARU Region 1 / AMSAT-DL band plan),
-/// for labels.
-pub fn segment(downlink_hz: f64) -> &'static str {
-    let khz = (downlink_hz - DOWNLINK_LOW_HZ) / 1e3;
-    match khz {
-        k if k < 5.0 => "beacon",
-        k if k < 40.0 => "CW",
-        k if k < 80.0 => "digital",
-        k if k < 245.0 => "SSB",
-        k if k < 255.0 => "beacon",
-        k if k < 495.0 => "SSB",
-        _ => "beacon",
+/// What a part of the transponder is used for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Use {
+    Beacon,
+    Cw,
+    /// Narrow digital modes; FT8 usually at 10489.540.
+    Digital,
+    /// Digital modes and SSB.
+    Mixed,
+    Ssb,
+}
+
+impl Use {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Beacon => "beacon",
+            Self::Cw => "CW",
+            Self::Digital => "digital",
+            Self::Mixed => "digi/SSB",
+            Self::Ssb => "SSB",
+        }
     }
+}
+
+/// The narrow-band transponder's band plan (IARU Region 1 / AMSAT-DL), downlink (Hz).
+pub const SEGMENTS: [(f64, f64, Use); 8] = [
+    (10_489.495e6, 10_489.505e6, Use::Beacon),
+    (10_489.505e6, 10_489.540e6, Use::Cw),
+    (10_489.540e6, 10_489.580e6, Use::Digital),
+    (10_489.580e6, 10_489.650e6, Use::Mixed),
+    (10_489.650e6, 10_489.745e6, Use::Ssb),
+    (10_489.745e6, 10_489.755e6, Use::Beacon),
+    (10_489.755e6, 10_489.995e6, Use::Ssb),
+    (10_489.995e6, 10_490.005e6, Use::Beacon),
+];
+
+/// Usual activity in a part of the transponder, for labels.
+pub fn segment(downlink_hz: f64) -> &'static str {
+    SEGMENTS
+        .iter()
+        .find(|(a, b, _)| downlink_hz >= *a && downlink_hz < *b)
+        .map_or("", |s| s.2.label())
 }
 
 #[cfg(test)]
@@ -95,5 +124,10 @@ mod tests {
         assert_eq!(segment(10_489.541e6), "digital");
         assert_eq!(segment(10_489.725e6), "SSB");
         assert_eq!(segment(10_489.750e6), "beacon");
+        assert_eq!(segment(10_489.600e6), "digi/SSB");
+        // The segments follow each other without gaps.
+        for w in SEGMENTS.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
     }
 }

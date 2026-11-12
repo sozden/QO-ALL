@@ -89,6 +89,16 @@ pub struct App {
     model: Option<String>,
     tx_capable: Option<Result<(), String>>,
     warning: Option<String>,
+    /// Shown after the sample rate was changed for the radio on its own.
+    rate_notice: Option<String>,
+    /// Added to the estimated dBm (dB), from a calibration against a known level.
+    dbm_cal: f32,
+    /// The receive level, smoothed (dBm).
+    meter_dbm: f32,
+    /// The S-meter's needle: signal over the noise floor, smoothed (dB).
+    snr: f32,
+    /// The level fed in for a calibration (dBm).
+    cal_known_dbm: f32,
     error: Option<String>,
     rate: f64,
     /// Last known converter correction (Hz), kept for the next start.
@@ -331,6 +341,11 @@ impl App {
             model: None,
             tx_capable: None,
             warning: None,
+            rate_notice: None,
+            dbm_cal: s.get("dbm_cal_db").unwrap_or(0.0),
+            meter_dbm: -160.0,
+            snr: 0.0,
+            cal_known_dbm: -80.0,
             error: None,
             rate: 0.0,
             settings: s,
@@ -393,6 +408,39 @@ impl App {
     /// The volume the speaker plays at.
     fn speaker_volume(&self) -> f32 {
         if self.muted { 0.0 } else { self.volume }
+    }
+
+    /// A level in dBFS as dBm at the radio's antenna input (after the LNB): the radio's
+    /// full scale at 0 dB gain, less the receive gain, plus the calibration. Estimated
+    /// (automatic gain counts as 40 dB) until calibrated.
+    fn dbm(&self, dbfs: f32) -> f32 {
+        let full_scale = match self.config.device {
+            DeviceChoice::Iio(_) => -5.0,
+            DeviceChoice::RtlSdr(_) | DeviceChoice::RtlTcp(_) => -10.0,
+            DeviceChoice::HackRf(_) => -5.0,
+            DeviceChoice::Simulator => 0.0,
+        };
+        dbfs + full_scale - self.config.rx_gain.unwrap_or(40.0) as f32 + self.dbm_cal
+    }
+
+    /// Signal to noise in the receiver's passband, as on the spectrum: its strongest
+    /// point over the noise floor (dB). Needs no calibration.
+    fn snr_db(&self) -> Option<f32> {
+        let n = self.line.len();
+        if n < 2 {
+            return None;
+        }
+        let (lo, hi) = self.line_band;
+        let (pa, pb) = self.mode.passband(self.mode.default_bandwidth());
+        let listen = self.rx_listen();
+        let index = |hz: f64| (((hz - lo) / (hi - lo)) * n as f64).floor();
+        let (a, b) = (index(listen + pa), index(listen + pb));
+        if b < 0.0 || a >= n as f64 {
+            return None;
+        }
+        let (a, b) = (a.max(0.0) as usize, (b.max(a) as usize).min(n - 1));
+        let peak = self.line[a..=b].iter().copied().fold(f32::MIN, f32::max);
+        Some((peak - self.floor).max(0.0))
     }
 
     fn correction_now(&self) -> f64 {
@@ -513,8 +561,9 @@ impl App {
         }
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let Some(e) = &self.engine else { return };
+        let mut faster = false;
         let events: Vec<Event> = e.events.try_iter().collect();
         // A new measurement of the own signal: it came down this much off, so the uplink
         // moves the other way. Small ones (within the measuring accuracy) are left.
@@ -533,6 +582,7 @@ impl App {
         for ev in events {
             match ev {
                 Event::Opened { model, tx, warning } => {
+                    faster = needs_full_rate(&self.config, &model);
                     self.model = Some(model);
                     self.tx_capable = Some(tx);
                     self.warning = warning;
@@ -541,6 +591,15 @@ impl App {
                 Event::Rate(r) => self.rate = r,
                 Event::Error(e) => self.error = Some(e),
             }
+        }
+        if faster {
+            // A gigabit AD936x board (LibreSDR) drops the connection a few seconds into
+            // the low rate's FIR set-up; 2.4 MS/s works there.
+            self.config = self.config.clone().with_rate(2.4e6);
+            self.edit_rate = 2.4e6;
+            self.save();
+            self.start(ctx);
+            self.rate_notice = Some(self.t("Not a Pluto: switched to 2.4 MS/s", "Pluto değil: 2,4 MS/s'ye geçildi").into());
         }
     }
 
@@ -585,6 +644,7 @@ impl App {
         s.set("last_rtl_tcp", &self.edit_rtl_tcp);
         s.set("tx_enabled", self.config.tx_enabled);
         s.set("ppm", self.config.ppm);
+        s.set("dbm_cal_db", self.dbm_cal);
         s.set("ptt_port", &self.serial.config.ptt_port);
         s.set("ptt_line", self.serial.config.ptt_line.name());
         s.set("key_port", &self.serial.config.key_port);
@@ -683,6 +743,9 @@ impl App {
             if let Some(w) = &self.warning {
                 ui::pill(ui, w.clone(), RX(), RAISED());
             }
+            if let Some(n) = &self.rate_notice {
+                ui::pill(ui, n.clone(), BLUE(), RAISED());
+            }
             if self.rate > 0.0 && self.rate < self.config.sample_rate * 0.95 {
                 ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), TX(), RAISED())
                     .on_hover_text(self.t("The radio delivers fewer samples than set", "Cihaz ayarlanandan az örnek gönderiyor"));
@@ -731,6 +794,15 @@ impl App {
         let transmitting = status.state == TxState::Transmit;
         let level = self.engine.as_ref().map_or(-150.0, |e| e.listener.level_db());
         let width = (ui.available_width() - 60.0) / 2.0;
+        // The level in dBm (for the caption and the calibration), and the S-meter's
+        // needle: the signal over the noise, rising fast and falling slower.
+        let dbm = self.dbm(level);
+        self.meter_dbm += (dbm - self.meter_dbm) * if dbm > self.meter_dbm { 0.6 } else { 0.25 };
+        let snr = self.snr_db().unwrap_or(0.0);
+        self.snr += (snr - self.snr) * if snr > self.snr { 0.5 } else { 0.15 };
+        let needle = self.snr;
+        let caption_dbm = self.meter_dbm;
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
         // Top-aligned, so both displays line up whatever each holds.
         ui.horizontal_top(|ui| {
             // Receiver.
@@ -739,14 +811,28 @@ impl App {
                 .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
                     ui::card(ui, DEEP(), |ui| {
                         ui.set_width(ui.available_width());
-                        ui::caption(ui, format!("DOWNLINK · RX · {} · {:.0} dBFS", self.mode.name(), level), RX());
-                        let change = ui::vfo(ui, self.rx_dial, 34.0, RX());
-                        // Under it, as under the transmit side: the band plan's part, and
-                        // the RIT when on.
-                        let rit = if self.rit_on { format!(" · RIT {:+.0} Hz", self.rit) } else { String::new() };
-                        let line = format!("{}{rit}", bandplan::segment(self.rx_listen()).to_uppercase());
-                        ui.label(RichText::new(line).monospace().size(13.0).color(RX().gamma_multiply(0.75)));
-                        change
+                        // The frequency on the left, the signal meter on the right.
+                        ui.horizontal_top(|ui| {
+                            let meter_w = 250.0;
+                            let left = (ui.available_width() - meter_w - 12.0).max(200.0);
+                            let change = ui
+                                .allocate_ui_with_layout(vec2(left, 150.0), column, |ui| {
+                                    ui::caption(ui, format!("DOWNLINK · RX · {} · {caption_dbm:.0} dBm", self.mode.name()), RX());
+                                    let change = ui::vfo(ui, self.rx_dial, 34.0, RX());
+                                    // Under it, as under the transmit side: the band plan's part,
+                                    // and the RIT when on.
+                                    let rit = if self.rit_on { format!(" · RIT {:+.0} Hz", self.rit) } else { String::new() };
+                                    let line = format!("{}{rit}", bandplan::segment(self.rx_listen()).to_uppercase());
+                                    ui.label(RichText::new(line).monospace().size(13.0).color(RX().gamma_multiply(0.75)));
+                                    change
+                                })
+                                .inner;
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                ui::s_meter(ui, meter_w, needle);
+                            });
+                            change
+                        })
+                        .inner
                     })
                 })
                 .inner;
@@ -775,6 +861,8 @@ impl App {
                 .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
                     ui::card(ui, fill, |ui| {
                         ui.set_width(ui.available_width());
+                        // As tall as the receive card with its meter.
+                        ui.set_min_height(150.0);
                         let shift = if self.linked { String::new() } else { format!(" · shift {:+.2} kHz", shift / 1e3) };
                         ui::caption(ui, format!("TX · USB{shift}"), TX());
                         let change = ui::vfo(ui, down, 34.0, TX());
@@ -867,7 +955,9 @@ impl App {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(8), DEEP());
         let spec = Rect::from_min_size(rect.min, vec2(rect.width(), (rect.height() * 0.36).max(80.0)));
-        let axis_h = 18.0;
+        // Under the spectrum: the band plan's segments, then the frequency axis.
+        let strip_h = 16.0;
+        let axis_h = strip_h + 18.0;
         let wf = Rect::from_min_max(pos2(rect.left(), spec.bottom() + axis_h), rect.max);
         painter.image(tex.id(), wf, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
@@ -887,17 +977,56 @@ impl App {
         let step = ui::nice_step(width_hz / (rect.width() as f64 / 110.0));
         let axis = Rect::from_min_max(pos2(rect.left(), spec.bottom()), pos2(rect.right(), wf.top()));
         painter.rect_filled(axis, CornerRadius::ZERO, BG());
+        let strip = Rect::from_min_size(axis.min, vec2(axis.width(), strip_h));
+        let scale_y = (strip.bottom() + axis.bottom()) / 2.0;
         let mut f = (lo_hz / step).ceil() * step;
         while f <= hi_hz {
             let x = x_of(f);
             painter.line_segment([pos2(x, spec.top()), pos2(x, spec.bottom())], Stroke::new(1.0, GRID()));
             let label = if step >= 1e3 { format!("{:.3}", f / 1e6) } else { format!("{:.4}", f / 1e6) };
-            painter.text(pos2(x, axis.center().y), Align2::CENTER_CENTER, label, FontId::monospace(11.0), DIM());
+            painter.text(pos2(x, scale_y), Align2::CENTER_CENTER, label, FontId::monospace(11.0), DIM());
             f += step;
+        }
+        // Band plan: CW, digital (FT8), mixed, SSB and the beacons.
+        for (a, b, use_) in bandplan::SEGMENTS {
+            let (x0, x1) = (x_of(a).max(rect.left()), x_of(b).min(rect.right()));
+            if x1 <= x0 {
+                continue;
+            }
+            let color = match use_ {
+                bandplan::Use::Beacon => TX(),
+                bandplan::Use::Cw => GOOD(),
+                bandplan::Use::Digital => BLUE(),
+                bandplan::Use::Mixed => MUTED(),
+                bandplan::Use::Ssb => RX(),
+            };
+            let r = Rect::from_min_max(pos2(x0, strip.top() + 2.0), pos2(x1, strip.bottom() - 1.0)).shrink2(vec2(1.0, 0.0));
+            painter.rect_filled(r, CornerRadius::same(3), color.gamma_multiply(0.22));
+            // A faint tint of the same colour along the spectrum's foot.
+            painter.rect_filled(Rect::from_min_max(pos2(x0, spec.bottom() - 2.0), pos2(x1, spec.bottom())), CornerRadius::ZERO, color.gamma_multiply(0.6));
+            let label = match use_ {
+                bandplan::Use::Digital => "FT8 · DIGI".to_string(),
+                u => u.label().to_uppercase(),
+            };
+            let galley = painter.layout_no_wrap(label, FontId::proportional(10.5), color);
+            if galley.size().x + 6.0 < r.width() {
+                painter.galley(r.center() - galley.size() / 2.0, galley, color);
+            }
         }
         // Spectrum line, filled below.
         let (db_lo, db_hi) = (self.floor - 8.0, self.floor + 55.0);
         let y_of = |db: f32| spec.bottom() - ((db - db_lo) / (db_hi - db_lo)).clamp(0.0, 1.0) * (spec.height() - 14.0);
+        // Level scale in dBm (per FFT bin), every 10 dB, at the left.
+        let off = self.dbm(0.0);
+        let mut d = ((db_lo + off) / 10.0).ceil() * 10.0;
+        while d <= db_hi + off {
+            let y = y_of(d - off);
+            if y > spec.top() + 16.0 && y < spec.bottom() - 4.0 {
+                painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, GRID().gamma_multiply(0.7)));
+                painter.text(pos2(rect.left() + 4.0, y - 1.0), Align2::LEFT_BOTTOM, format!("{d:.0} dBm"), FontId::monospace(10.0), DIM());
+            }
+            d += 10.0;
+        }
         if self.line.len() > 1 {
             let n = self.line.len();
             let points: Vec<egui::Pos2> =
@@ -1463,8 +1592,8 @@ impl App {
         }
         for &rate in device.rates() {
             let label = match (&device, rate) {
-                (DeviceChoice::Simulator | DeviceChoice::Iio(_), r) if r < 1e6 => self.t("0.6 MS/s · Ethernet (FIR filter in the radio)", "0.6 MS/s · Ethernet (cihazda FIR filtresi)").to_string(),
-                (DeviceChoice::Simulator | DeviceChoice::Iio(_), _) => "2.4 MS/s · USB".to_string(),
+                (DeviceChoice::Simulator | DeviceChoice::Iio(_), r) if r < 1e6 => self.t("0.6 MS/s · Pluto on Ethernet (FIR filter in the radio)", "0.6 MS/s · Ethernet'li Pluto (cihazda FIR filtresi)").to_string(),
+                (DeviceChoice::Simulator | DeviceChoice::Iio(_), _) => self.t("2.4 MS/s · USB, LibreSDR", "2.4 MS/s · USB, LibreSDR").to_string(),
                 (DeviceChoice::RtlSdr(_) | DeviceChoice::RtlTcp(_), r) if r < 2e6 => self.t("1.8 MS/s · for a slower network", "1.8 MS/s · yavaş ağ için").to_string(),
                 (_, r) => format!("{:.1} MS/s", r / 1e6),
             };
@@ -1607,6 +1736,34 @@ impl App {
                 "For radios without a TCXO (many RTL-SDRs, HackRF): the beacon lock looks only ±15 kHz around where the beacon should be. Positive: the radio tunes high.",
                 "TCXO'suz cihazlar için (çoğu RTL-SDR, HackRF): beacon kilidi beacon'ın olması gereken yerin yalnızca ±15 kHz çevresine bakar. Pozitif: cihaz yüksek ayarlıyor.",
             ));
+            ui.horizontal(|ui| {
+                ui.label(self.t("dBm calibration", "dBm kalibrasyonu"));
+                if ui.add(egui::DragValue::new(&mut self.dbm_cal).speed(0.5).range(-60.0..=60.0).suffix(" dB").max_decimals(1)).changed() {
+                    self.save();
+                }
+            })
+            .response
+            .on_hover_text(self.t(
+                "dBm readings are estimated from the radio's gain. Feed a known level (signal generator) and set this so the meter shows it.",
+                "dBm değerleri cihaz kazancından tahmin edilir. Bilinen bir seviye (sinyal üreteci) verip gösterge onu gösterecek şekilde ayarlayın.",
+            ));
+            // Calibrating in one step: the level fed in, the meter's reading now.
+            let reading = self.meter_dbm;
+            ui.horizontal(|ui| {
+                ui.label(self.t("Level fed in", "Verilen seviye"));
+                ui.add(egui::DragValue::new(&mut self.cal_known_dbm).speed(0.5).range(-150.0..=0.0).suffix(" dBm").max_decimals(1));
+                let ok = reading > -150.0;
+                if ui.add_enabled(ok, egui::Button::new(self.t("Calibrate", "Kalibre et"))).clicked() {
+                    self.dbm_cal = ((self.dbm_cal + self.cal_known_dbm - reading) * 10.0).round() / 10.0;
+                    self.save();
+                }
+            })
+            .response
+            .on_hover_text(self.t(
+                "With the generator's tone in the receiver's passband (manual gain): the calibration is set so the meter shows this level.",
+                "Üretecin tonu alıcının geçiş bandındayken (elle kazanç): kalibrasyon, gösterge bu seviyeyi gösterecek şekilde ayarlanır.",
+            ));
+            ui.label(RichText::new(format!("{}: {reading:.1} dBm", self.t("Meter now", "Gösterge şu an"))).size(11.0).color(DIM()));
             ui.horizontal(|ui| {
                 let label = self.t("Automatic gain", "Otomatik kazanç");
                 ui.checkbox(&mut self.edit_auto_gain, label);
@@ -1768,6 +1925,17 @@ fn device_combo(ui: &mut egui::Ui, salt: &str, list: &[qo_all::audio::OutputDevi
     (pick.filter(|p| p != current), r.clicked())
 }
 
+/// Whether an AD936x radio opened at the low (Ethernet FIR) rate should rather run at
+/// 2.4 MS/s: only an ADALM-Pluto needs the low rate (its Ethernet is 100 Mbit); other
+/// boards on the network, such as the LibreSDR (gigabit, Tezuka firmware), lose the
+/// connection with the low rate's FIR filters.
+fn needs_full_rate(config: &StationConfig, model: &str) -> bool {
+    matches!(config.device, DeviceChoice::Iio(_))
+        && config.sample_rate < qo_all::iio::FIR_RATE_LIMIT
+        && !model.trim().is_empty()
+        && !model.to_lowercase().contains("pluto")
+}
+
 fn clock(secs: u64) -> String {
     let s = secs % 86_400;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -1780,7 +1948,7 @@ fn ft_line(m: &Ft8Message) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll();
+        self.poll(&ui.ctx().clone());
         // Space held = push to talk; Escape drops a latched PTT.
         let typing = ui.ctx().egui_wants_keyboard_input();
         let (space, escape) = ui.input(|i| (i.key_down(egui::Key::Space), i.key_pressed(egui::Key::Escape)));

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 — 2026-11-12
+
+- **S-meter**: a classic needle meter beside the receive frequency, S1–S9 and +10…+60 dB
+  over an S/N scale in dB. The S units count from the noise floor (S0 = the noise, 6 dB
+  per S unit, S9 = 54 dB above it), so it needs no calibration. Backlit warm on the paper
+  theme, a glowing night face on the night theme.
+- **dBm**: the receive level in dBm in the receiver's caption and a dBm scale on the
+  spectrum, estimated from the radio's gain; calibrated in the settings in one step
+  (feed a known level, press Calibrate).
+- **Band plan on the spectrum**: CW, digital (FT8), digital/SSB, SSB and the beacons as a
+  coloured strip under the spectrum.
+- **FT8/FT4 transmit at once**: a call picked (or an answer due) in the own slot goes out
+  straight away, as in WSJT-X, its beginning cut so the rest keeps the slot's timing (up
+  to 4.5 s late in FT8, 1.8 s in FT4); later than that the next slot is used.
+- **LibreSDR**: an AD936x radio on the network that is not a Pluto (LibreSDR, gigabit)
+  is switched to 2.4 MS/s by itself; at 0.6 MS/s the Tezuka firmware dropped the
+  connection after a few seconds (error -10054).
+- **Larger log form**: the new/correct contact fields are bigger, with a larger font.
+
 ## 0.6.0 — 2026-11-09
 
 - **Receivers too**: besides the ADALM-Pluto and LibreSDR (AD936x, receive and

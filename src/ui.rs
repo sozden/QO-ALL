@@ -208,6 +208,170 @@ pub fn level_bar(ui: &mut egui::Ui, width: f32, value: f32, range: (f32, f32), c
     }
 }
 
+fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let (a, b) = (a.to_array(), b.to_array());
+    let c: Vec<u8> = (0..4).map(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8).collect();
+    Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3])
+}
+
+/// Colour at `t` (0..1) along gradient stops.
+fn gradient(stops: &[(f32, Color32)], t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    for w in stops.windows(2) {
+        if t <= w[1].0 {
+            return mix(w[0].1, w[1].1, (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6));
+        }
+    }
+    stops.last().map_or(Color32::TRANSPARENT, |s| s.1)
+}
+
+/// Fills `rect` with a grid mesh coloured point by point: gradients egui has no shapes for.
+fn shade(p: &egui::Painter, rect: Rect, nx: u32, ny: u32, color: impl Fn(Pos2) -> Color32) {
+    let mut m = egui::Mesh::default();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            let pos = pos2(rect.left() + rect.width() * i as f32 / nx as f32, rect.top() + rect.height() * j as f32 / ny as f32);
+            m.colored_vertex(pos, color(pos));
+        }
+    }
+    let w = nx + 1;
+    for j in 0..ny {
+        for i in 0..nx {
+            let a = j * w + i;
+            m.add_triangle(a, a + 1, a + w);
+            m.add_triangle(a + 1, a + w + 1, a + w);
+        }
+    }
+    p.add(egui::Shape::mesh(m));
+}
+
+/// Where `db` (above the noise floor) sits on the S-meter scale (0..1): S1..S9 in 6 dB
+/// steps over the first 60 %, then +10..+60 dB.
+fn s_fraction(db: f32) -> f32 {
+    if db <= 54.0 { db.max(0.0) / 54.0 * 0.6 } else { (0.6 + (db - 54.0) / 60.0 * 0.4).min(1.0) }
+}
+
+/// "S7", "S9+12".
+pub fn s_units(db: f32) -> String {
+    if db < 54.0 { format!("S{}", (db.max(0.0) / 6.0).floor() as i32) } else { format!("S9+{:.0}", db - 54.0) }
+}
+
+/// A classic S-meter behind glass in a chrome bezel: "SIGNAL LEVEL" in S units over an
+/// S/N scale in dB, one needle for both. `db` is the signal over the noise floor, so S0
+/// is the noise and S9 is 54 dB above it. Backlit warm on the paper theme, a glowing
+/// night face on the night theme.
+pub fn s_meter(ui: &mut egui::Ui, width: f32, db: f32) {
+    let k = width / 300.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 180.0 * k), Sense::hover());
+    let p = ui.painter_at(rect);
+    let at = |x: f32, y: f32| rect.min + vec2(x, y) * k;
+    // Points on the scale: radius and fraction, around a pivot below the face.
+    let on = |r: f32, f: f32| {
+        let a = (228.0 + 84.0 * f).to_radians();
+        at(150.0 + r * a.cos(), 230.0 + r * a.sin())
+    };
+    let warm = palette::light();
+    let (face, ink, red, needle, glare, glow) = if warm {
+        ([rgb(0xffe9b0), rgb(0xffb84a), rgb(0xe07a12)], rgb(0x2a1a08), rgb(0xb3121a), rgb(0xc8101a), 0.40, false)
+    } else {
+        ([rgb(0x3a4a66), rgb(0x162238), rgb(0x05080f)], rgb(0xf6c35a), rgb(0xff5a4a), rgb(0xff6a5a), 0.16, true)
+    };
+    let line = |a: Pos2, b: Pos2, w: f32, c: Color32| {
+        if glow {
+            p.line_segment([a, b], Stroke::new((w + 3.0) * k, c.gamma_multiply(0.22)));
+        }
+        p.line_segment([a, b], Stroke::new(w * k, c));
+    };
+    let arc = |r: f32, from: f32, to: f32, w: f32, c: Color32| {
+        let pts: Vec<Pos2> = (0..=48).map(|i| on(r, from + (to - from) * i as f32 / 48.0)).collect();
+        if glow {
+            p.add(egui::Shape::line(pts.clone(), Stroke::new((w + 3.0) * k, c.gamma_multiply(0.22))));
+        }
+        p.add(egui::Shape::line(pts, Stroke::new(w * k, c)));
+    };
+    let text = |pos: Pos2, s: &str, size: f32, c: Color32| {
+        p.text(pos, egui::Align2::CENTER_CENTER, s, FontId::proportional((size * k).max(9.0)), c);
+    };
+
+    // The lit face, without a frame: it sits on the card like the rest of the window.
+    let face_rect = Rect::from_min_max(at(4.0, 4.0), at(296.0, 176.0));
+    let centre = at(150.0, 162.0);
+    let (rx, ry) = (294.0 * k, 168.0 * k);
+    let stops = [(0.0, face[0]), (0.5, face[1]), (1.0, face[2])];
+    shade(&p, face_rect, 28, 14, |q| gradient(&stops, (((q.x - centre.x) / rx).powi(2) + ((q.y - centre.y) / ry).powi(2)).sqrt()));
+
+    // S scale: S1..S9, then +10..+60 in red on a thick band.
+    arc(160.0, 0.0, 0.6, 1.6, ink);
+    arc(160.0, 0.6, 1.0, 1.6, red);
+    arc(163.0, 0.6, 1.0, 5.0, red);
+    for s in 1..=9 {
+        let f = s_fraction(6.0 * s as f32);
+        let major = s % 2 == 1;
+        line(on(160.0, f), on(if major { 172.0 } else { 167.0 }, f), if major { 2.0 } else { 1.2 }, ink);
+        if major {
+            text(on(186.0, f), &s.to_string(), 15.0, ink);
+        }
+    }
+    for d in 1..=6 {
+        let f = s_fraction(54.0 + 10.0 * d as f32);
+        let major = d % 2 == 0;
+        line(on(160.0, f), on(if major { 172.0 } else { 167.0 }, f), if major { 2.0 } else { 1.2 }, red);
+        if major {
+            text(on(186.0, f), &format!("+{}", 10 * d), 13.0, red);
+        }
+    }
+    // The "S" badge in the corner.
+    let badge = at(28.0, 28.0);
+    p.rect_stroke(Rect::from_center_size(badge, vec2(15.0, 15.0) * k), CornerRadius::same((3.0 * k) as u8), Stroke::new(1.3 * k, ink), egui::StrokeKind::Middle);
+    text(badge, "S", 11.0, ink);
+    // S/N scale in dB under it, on the same needle.
+    arc(126.0, 0.0, 1.0, 1.3, ink);
+    for d in (0..=110).step_by(10) {
+        let f = s_fraction(d as f32);
+        let major = d % 20 == 0;
+        line(on(126.0, f), on(if major { 117.0 } else { 121.0 }, f), if major { 1.6 } else { 1.0 }, ink);
+        if major && d <= 100 {
+            text(on(106.0, f), &d.to_string(), 10.0, ink);
+        }
+    }
+    text(at(150.0, 88.0), "SIGNAL LEVEL", 12.0, ink);
+    text(at(150.0, 146.0), "S/N dB", 10.0, ink);
+    p.text(at(280.0, 158.0), egui::Align2::RIGHT_CENTER, s_units(db), FontId::monospace(13.0 * k), ink.gamma_multiply(0.85));
+
+    // Needle with its shadow, the pivot cover and the glass, inside the face.
+    let fp = p.with_clip_rect(face_rect);
+    let tip = on(168.0, s_fraction(db));
+    fp.line_segment([at(153.0, 234.0), tip + vec2(3.0, 4.0) * k], Stroke::new(2.5 * k, Color32::from_black_alpha(56)));
+    if glow {
+        fp.line_segment([at(150.0, 230.0), tip], Stroke::new(5.0 * k, needle.gamma_multiply(0.25)));
+    }
+    fp.line_segment([at(150.0, 230.0), tip], Stroke::new(1.8 * k, needle));
+    let cap = at(150.0, 194.0);
+    for i in 0..10 {
+        let t = i as f32 / 9.0;
+        let r = 24.0 * k * (1.0 - 0.85 * t);
+        fp.circle_filled(cap + vec2(-4.0, -6.0) * k * t, r, mix(rgb(0x22262c), rgb(0xb9c0c8), t));
+    }
+    let (gc, grx, gry) = (at(150.0, -35.0), 240.0 * k, 100.0 * k);
+    shade(&fp, face_rect, 28, 16, |q| {
+        let inside = ((q.x - gc.x) / grx).powi(2) + ((q.y - gc.y) / gry).powi(2) < 1.0;
+        let fade = 1.0 - (q.y - (gc.y - gry)) / (2.0 * gry);
+        if inside { Color32::from_white_alpha((glare * fade.clamp(0.0, 1.0) * 255.0) as u8) } else { Color32::TRANSPARENT }
+    });
+    // A soft inner shadow and the window's own thin border; the face's square corners
+    // are rounded off in the card's colour.
+    let radius = 8.0 * k;
+    let shadow = if warm { 30 } else { 70 };
+    p.rect_stroke(face_rect, CornerRadius::same(radius as u8), Stroke::new(2.0 * k, Color32::from_black_alpha(shadow)), egui::StrokeKind::Inside);
+    let w = radius;
+    p.rect_stroke(face_rect.expand(w), CornerRadius::same((radius + w) as u8), Stroke::new(w, DEEP()), egui::StrokeKind::Inside);
+    p.rect_stroke(face_rect, CornerRadius::same(radius as u8), Stroke::new(1.0, BORDER()), egui::StrokeKind::Outside);
+}
+
 /// The chain between the two frequency displays: closed when linked.
 pub fn link_button(ui: &mut egui::Ui, linked: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
