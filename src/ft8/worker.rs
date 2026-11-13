@@ -79,6 +79,8 @@ pub struct Ft8 {
     /// Start times of recent decodes against the computer's clock (DT plus the delay
     /// in use then), for learning the delay.
     starts: Arc<Mutex<VecDeque<f64>>>,
+    /// The operator's call sign, for hashed references to it.
+    my_call: Arc<Mutex<String>>,
 }
 
 fn now_utc() -> f64 {
@@ -93,11 +95,19 @@ impl Ft8 {
             messages: Arc::default(),
             status: Arc::default(),
             starts: Arc::default(),
+            my_call: Arc::default(),
         }
     }
 
     pub fn set_dial(&self, dial: Option<f64>) {
         *self.dial.lock().unwrap() = dial;
+    }
+
+    pub fn set_my_call(&self, call: &str) {
+        let mut mine = self.my_call.lock().unwrap();
+        if *mine != call {
+            *mine = call.to_string();
+        }
     }
 
     pub fn messages(&self) -> Vec<Ft8Message> {
@@ -284,7 +294,14 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             save_slot(p, &samples, slot_secs);
             let lo = AUDIO_RANGE_HZ.0 - CENTER_ABOVE_DIAL_HZ;
             let hi = AUDIO_RANGE_HZ.1 - CENTER_ABOVE_DIAL_HZ;
-            let found = decode::decode_slot(p, &samples, lo, hi, &mut book2.lock().unwrap());
+            let mut book = book2.lock().unwrap();
+            // Our own call is known, so messages to it with its hash show it.
+            let mine = me2.my_call.lock().unwrap().clone();
+            if !mine.is_empty() {
+                book.remember(&mine);
+            }
+            let found = decode::decode_slot(p, &samples, lo, hi, &mut book);
+            drop(book);
             let mut messages = me2.messages.lock().unwrap();
             for d in &found {
                 messages.push(Ft8Message {

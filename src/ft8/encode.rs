@@ -4,7 +4,7 @@
 
 use std::f64::consts::PI;
 
-use super::message::{pack_standard, pack_text};
+use super::message::pack;
 use super::{FT4, Protocol, ldpc};
 
 /// Seconds per symbol.
@@ -12,10 +12,10 @@ fn symbol_s(p: &Protocol) -> f64 {
     p.sps as f64 / p.rate
 }
 
-/// The tones of a message, or None if it cannot be encoded (standard messages and free
-/// text of up to 13 characters).
+/// The tones of a message, or None if it cannot be encoded (standard messages, ones
+/// with a non-standard call, and free text of up to 13 characters).
 pub fn tones(p: &Protocol, text: &str) -> Option<Vec<usize>> {
-    let mut bits = pack_standard(text).or_else(|| pack_text(text))?;
+    let mut bits = pack(text)?;
     if let Some(r) = p.scramble {
         bits.iter_mut().zip(r.iter()).for_each(|(b, r)| *b ^= r);
     }
@@ -135,6 +135,7 @@ mod tests {
     fn ft8_round_trip() {
         round_trip(&FT8, "CQ TA4SO KM46");
         round_trip(&FT8, "DL1ABC TA4SO R-07");
+        round_trip(&FT8, "CQ C9/ZS6WAB");
     }
 
     #[test]

@@ -278,7 +278,7 @@ impl FtPanel {
             let odd = ((slot as f64 / p.slot_s).round() as u64) % 2 == 1;
             for m in &messages {
                 if self.involves_me(&m.text) {
-                    let color = if matches!(parse(&m.text), Parsed::Directed { ref to, .. } if *to == self.seq.my_call) { TX() } else { TEXT() };
+                    let color = if matches!(parse(&m.text), Parsed::Directed { ref to, .. } if *to == self.seq.my_call) { ALERT() } else { TEXT() };
                     self.line(format!("{} {:+3.0} {:4.0}  {}", hms(m.slot), m.snr_db, m.audio_hz, m.text), color);
                 }
             }
@@ -331,7 +331,7 @@ impl FtPanel {
             self.acked = Some(id);
             if let Some(sc) = self.scheduled.take().filter(|s| s.id == id) {
                 self.last_tx_slot = Some(sc.slot);
-                self.line(format!("{} TX      {}", hms(sc.slot * p.slot_s as u64), sc.text), RX());
+                self.line(format!("{} TX      {}", hms(sc.slot * p.slot_s as u64), sc.text), TX());
                 // Counts only if the sequence did not move on meanwhile.
                 if sc.step == self.seq.next {
                     self.seq.sent(now as u64);
@@ -435,7 +435,7 @@ impl FtPanel {
         let me = &self.seq.my_call;
         match parse(text) {
             Parsed::Directed { to, .. } if !me.is_empty() && to == *me => (Some(TO_ME_BG()), ROW_TEXT()),
-            Parsed::Directed { from, .. } | Parsed::Cq { from, .. } if !me.is_empty() && from == *me => (None, RX()),
+            Parsed::Directed { from, .. } | Parsed::Cq { from, .. } if !me.is_empty() && from == *me => (None, TX()),
             Parsed::Cq { from, grid } if self.alerts.dxcc_show && self.novelty(&from, grid.as_deref()).0 => {
                 (Some(NEW_DXCC_BG()), ROW_TEXT())
             }
@@ -568,7 +568,7 @@ impl FtPanel {
                 }
             }
             let (label, on) = if self.enabled { (t("Tx enabled", "Tx açık"), true) } else { (t("Enable Tx", "Tx'i aç"), false) };
-            if ui::choice(ui, label, on, TX()) {
+            if ui::choice(ui, label, on, ALERT()) {
                 self.enabled = !self.enabled;
                 if self.enabled {
                     self.seq.done = false;
@@ -618,7 +618,7 @@ impl FtPanel {
             _ => String::new(),
         };
         let st = if self.status.is_empty() { state } else if state.is_empty() { self.status.clone() } else { format!("{state} · {}", self.status) };
-        ui.label(RichText::new(st).size(11.0).color(RX()));
+        ui.label(RichText::new(st).size(11.0).color(TX()));
         let _ = e;
     }
 }

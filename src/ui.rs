@@ -34,14 +34,17 @@ pub mod palette {
     pub fn TEXT() -> Color32 { pick([0xc9, 0xd4, 0xe3], [0x2b, 0x24, 0x1a]) }
     pub fn MUTED() -> Color32 { pick([0x8f, 0xa3, 0xbf], [0x6b, 0x5e, 0x49]) }
     pub fn DIM() -> Color32 { pick([0x5f, 0x73, 0x91], [0x9c, 0x8f, 0x78]) }
-    pub fn RX() -> Color32 { pick([0xf2, 0xb3, 0x3d], [0x9a, 0x5b, 0x00]) }
-    pub fn TX() -> Color32 { pick([0xff, 0x7a, 0x7a], [0xb0, 0x30, 0x2a]) }
+    /// Receiving: blue. Transmitting (and cautions): amber. Red is kept for being on
+    /// the air, errors and what is forbidden.
+    pub fn RX() -> Color32 { pick([0x5c, 0xc8, 0xff], [0x1f, 0x5f, 0xa8]) }
+    pub fn TX() -> Color32 { pick([0xf2, 0xb3, 0x3d], [0x9a, 0x5b, 0x00]) }
+    pub fn ALERT() -> Color32 { pick([0xff, 0x7a, 0x7a], [0xb0, 0x30, 0x2a]) }
     pub fn GOOD() -> Color32 { pick([0x6f, 0xd3, 0x9a], [0x2e, 0x6b, 0x3c]) }
     pub fn BLUE() -> Color32 { pick([0x8f, 0xb3, 0xe8], [0x36, 0x5f, 0x8c]) }
     /// Strongest text: white at night, near black by day.
     pub fn STRONG() -> Color32 { pick([0xff, 0xff, 0xff], [0x1a, 0x14, 0x0c]) }
-    /// Backgrounds of transmitting and of good news.
-    pub fn TX_BG() -> Color32 { pick([0x3a, 0x14, 0x18], [0xf6, 0xdc, 0xd5]) }
+    /// Backgrounds of being on the air (and errors) and of good news.
+    pub fn ALERT_BG() -> Color32 { pick([0x3a, 0x14, 0x18], [0xf6, 0xdc, 0xd5]) }
     pub fn GOOD_BG() -> Color32 { pick([0x12, 0x30, 0x1f], [0xdf, 0xec, 0xcf]) }
 }
 use palette::*;
@@ -94,6 +97,40 @@ pub fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, add)
         .inner
+}
+
+/// A card with a line of its role's colour along the top (receive, transmit).
+pub fn accent_card<R>(ui: &mut egui::Ui, fill: Color32, accent: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let shown = egui::Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, BORDER()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, add);
+    let r = shown.response.rect;
+    ui.painter().line_segment([pos2(r.left() + 7.0, r.top() + 1.0), pos2(r.right() - 7.0, r.top() + 1.0)], Stroke::new(2.0, accent));
+    shown.inner
+}
+
+/// One choice out of a few, as joined segments in one frame: the chosen one filled.
+/// Returns the segment clicked.
+pub fn segmented(ui: &mut egui::Ui, items: &[(&str, bool)], color: Color32) -> Option<usize> {
+    let mut clicked = None;
+    egui::Frame::new().fill(RAISED()).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(2)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding = vec2(12.0, 3.0);
+            for (i, (text, on)) in items.iter().enumerate() {
+                // On the filled segment: dark text at night, light on paper.
+                let (fg, bg) = if *on { (if light() { DEEP() } else { BG() }, color) } else { (MUTED(), Color32::TRANSPARENT) };
+                let button = egui::Button::new(RichText::new(*text).size(12.5).strong().color(fg)).fill(bg).corner_radius(6).frame_when_inactive(*on);
+                if ui.add(button).clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    });
+    clicked
 }
 
 /// A small caption above a value.
@@ -398,11 +435,11 @@ pub fn ptt_button(ui: &mut egui::Ui, on: bool, enabled: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::click());
     let p = ui.painter();
     let c = rect.center();
-    let color = if enabled { TX() } else { DIM() };
+    let color = if enabled { ALERT() } else { DIM() };
     if on {
-        p.circle_filled(c, 34.0, TX().gamma_multiply(0.85));
+        p.circle_filled(c, 34.0, ALERT().gamma_multiply(0.85));
     } else if response.hovered() && enabled {
-        p.circle_filled(c, 34.0, TX().gamma_multiply(0.15));
+        p.circle_filled(c, 34.0, ALERT().gamma_multiply(0.15));
     }
     p.circle_stroke(c, 34.0, Stroke::new(2.0, color));
     p.text(c, egui::Align2::CENTER_CENTER, "PTT", FontId::proportional(17.0), if on { BG() } else { color });

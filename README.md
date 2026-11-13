@@ -6,7 +6,7 @@ Full-duplex SSB, CW and FT8/FT4 transceiver for the narrow-band transponder of t
 (Es'hail-2) geostationary satellite. Listen on 10 GHz and transmit on 2.4 GHz at the same
 time with one ADALM-Pluto (or a similar AD936x radio over Ethernet or USB).
 
-**Status: 0.7.0.** SSB, FT8, the beacon lock and the automatic uplink correction are in
+**Status: 0.7.1.** SSB, FT8, the beacon lock and the automatic uplink correction are in
 use on the air with a Pluto on Ethernet; CW sending is new.
 Windows (64-bit and 32-bit) and Linux (x86-64) packages.
 Reports are welcome in the [issues](https://github.com/sozden/QO-ALL/issues). See the
@@ -91,7 +91,7 @@ QO-100 (Es'hail-2) uydusunun dar bant transponderi için full duplex SSB ve FT8/
 alıcı-verici. Tek bir ADALM-Pluto (veya Ethernet/USB ile bağlı benzer AD936x cihaz) ile
 10 GHz'de dinlerken aynı anda 2.4 GHz'de yayın yapılır.
 
-**Durum: 0.7.0.** SSB, FT8, beacon kilidi ve otomatik uplink
+**Durum: 0.7.1.** SSB, FT8, beacon kilidi ve otomatik uplink
 düzeltmesi Ethernet'li Pluto ile yayında kullanılıyor; CW gönderimi yeni. Windows (64 ve
 32 bit) ve Linux paketleri [sürümler](https://github.com/sozden/QO-ALL/releases) sayfasında;
 Windows'ta açıp `qo-all.exe`'yi çalıştırmak yeterli, Linux'ta `INSTALL.txt`'ye bakın. Hata ve önerileri [issues](https://github.com/sozden/QO-ALL/issues)

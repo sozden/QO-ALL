@@ -543,6 +543,8 @@ impl App {
         // In FT8/FT4 the decoders follow the dial; otherwise FT8 runs on its usual one.
         let ft_dial = if self.digital.is_some() { self.rx_dial } else { FT_DIAL_HZ };
         e.ft8.set_dial(Some(to_if(ft_dial)));
+        e.ft8.set_my_call(&self.ft.seq.my_call);
+        e.ft4.set_my_call(&self.ft.seq.my_call);
         // The own signal's carrier should come down on the transmit dial (plus XIT).
         // In CW the modulator's carrier sits the tone's pitch below the dial.
         let carrier = self.tx_signal() - if self.mode == Mode::Cw && self.digital.is_none() { qo_all::keyer::TONE_HZ } else { 0.0 };
@@ -713,9 +715,26 @@ impl App {
             ui.add_space(-4.0);
             ui.label(RichText::new("ALL").size(19.0).strong().color(RX()));
             ui.add_space(10.0);
+            // The mode, as on a transceiver's front: one row of joined keys.
+            let digital = |p: &'static Protocol| self.digital.is_some_and(|d| std::ptr::eq(d, p));
+            let mut keys: Vec<(&str, bool)> = MODES.iter().map(|m| (m.name(), self.mode == *m && self.digital.is_none())).collect();
+            keys.push((FT8.name, digital(&FT8)));
+            keys.push((FT4.name, digital(&FT4)));
+            if let Some(i) = ui::segmented(ui, &keys, RX()) {
+                if i < MODES.len() {
+                    self.set_digital(None);
+                    self.mode = MODES[i];
+                } else {
+                    let p: &'static Protocol = if i == MODES.len() { &FT8 } else { &FT4 };
+                    if !keys[i].1 {
+                        self.set_digital(Some(p));
+                    }
+                }
+            }
+            ui.add_space(10.0);
             match (&self.error, &self.model) {
                 (Some(e), _) => {
-                    ui::pill(ui, e.clone(), TX(), TX_BG());
+                    ui::pill(ui, e.clone(), ALERT(), ALERT_BG());
                 }
                 (None, Some(m)) => {
                     let duplex = match &self.tx_capable {
@@ -735,19 +754,19 @@ impl App {
                     GOOD(),
                     GOOD_BG(),
                 ),
-                Some(BeaconStatus::NotFound) => (self.t("Beacon not found", "Beacon bulunamadı").to_string(), TX(), RAISED()),
-                Some(BeaconStatus::OutsideBand) => (self.t("Beacon outside the band", "Beacon bant dışında").to_string(), TX(), RAISED()),
+                Some(BeaconStatus::NotFound) => (self.t("Beacon not found", "Beacon bulunamadı").to_string(), ALERT(), RAISED()),
+                Some(BeaconStatus::OutsideBand) => (self.t("Beacon outside the band", "Beacon bant dışında").to_string(), ALERT(), RAISED()),
                 _ => (self.t("Looking for the beacon…", "Beacon aranıyor…").to_string(), MUTED(), RAISED()),
             };
             ui::pill(ui, text, fg, bg);
             if let Some(w) = &self.warning {
-                ui::pill(ui, w.clone(), RX(), RAISED());
+                ui::pill(ui, w.clone(), TX(), RAISED());
             }
             if let Some(n) = &self.rate_notice {
                 ui::pill(ui, n.clone(), BLUE(), RAISED());
             }
             if self.rate > 0.0 && self.rate < self.config.sample_rate * 0.95 {
-                ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), TX(), RAISED())
+                ui::pill(ui, format!("{:.2} MS/s", self.rate / 1e6), ALERT(), RAISED())
                     .on_hover_text(self.t("The radio delivers fewer samples than set", "Cihaz ayarlanandan az örnek gönderiyor"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -768,7 +787,7 @@ impl App {
                 }
                 ui.add_space(10.0);
                 // Speaker volume and mute, in every mode (right to left here).
-                if ui::choice(ui, self.t("Mute", "Sessiz"), self.muted, TX()) {
+                if ui::choice(ui, self.t("Mute", "Sessiz"), self.muted, ALERT()) {
                     self.muted = !self.muted;
                 }
                 let mut percent = (self.volume * 100.0).round();
@@ -809,7 +828,7 @@ impl App {
             let column = egui::Layout::top_down(egui::Align::Min);
             let rx_change = ui
                 .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
-                    ui::card(ui, DEEP(), |ui| {
+                    ui::accent_card(ui, DEEP(), RX(), |ui| {
                         ui.set_width(ui.available_width());
                         // The frequency on the left, the signal meter on the right.
                         ui.horizontal_top(|ui| {
@@ -817,12 +836,14 @@ impl App {
                             let left = (ui.available_width() - meter_w - 12.0).max(200.0);
                             let change = ui
                                 .allocate_ui_with_layout(vec2(left, 150.0), column, |ui| {
-                                    ui::caption(ui, format!("DOWNLINK · RX · {} · {caption_dbm:.0} dBm", self.mode.name()), RX());
+                                    let mode = self.digital.map_or(self.mode.name(), |p| p.name);
+                                    ui::caption(ui, format!("RX · 10 GHz · {mode}"), RX());
                                     let change = ui::vfo(ui, self.rx_dial, 34.0, RX());
-                                    // Under it, as under the transmit side: the band plan's part,
+                                    // Under it: the band plan's part, the signal in figures,
                                     // and the RIT when on.
                                     let rit = if self.rit_on { format!(" · RIT {:+.0} Hz", self.rit) } else { String::new() };
-                                    let line = format!("{}{rit}", bandplan::segment(self.rx_listen()).to_uppercase());
+                                    let seg = bandplan::segment(self.rx_listen()).to_uppercase();
+                                    let line = format!("{seg} · {} · {caption_dbm:.0} dBm · S/N {needle:.0} dB{rit}", ui::s_units(needle));
                                     ui.label(RichText::new(line).monospace().size(13.0).color(RX().gamma_multiply(0.75)));
                                     change
                                 })
@@ -851,7 +872,8 @@ impl App {
             }
             // Transmitter.
             let shift = self.tx_downlink() - self.rx_dial;
-            let fill = if transmitting { TX_BG() } else { DEEP() };
+            // On the air the card turns red, whatever the theme.
+            let (fill, accent) = if transmitting { (ALERT_BG(), ALERT()) } else { (DEEP(), TX()) };
             // The big number is where the transmission comes down (10 GHz: in split the
             // place among the others), the uplink actually sent (2.4 GHz, corrections
             // included) under it.
@@ -859,14 +881,16 @@ impl App {
             let down = self.tx_signal();
             let tx_change = ui
                 .allocate_ui_with_layout(vec2(width, 80.0), column, |ui| {
-                    ui::card(ui, fill, |ui| {
+                    ui::accent_card(ui, fill, accent, |ui| {
                         ui.set_width(ui.available_width());
                         // As tall as the receive card with its meter.
                         ui.set_min_height(150.0);
-                        let shift = if self.linked { String::new() } else { format!(" · shift {:+.2} kHz", shift / 1e3) };
-                        ui::caption(ui, format!("TX · USB{shift}"), TX());
+                        let mode = self.digital.map_or(if self.mode == Mode::Cw { "CW" } else { "USB" }, |p| p.name);
+                        ui::caption(ui, format!("TX · 2.4 GHz · {mode}"), TX());
                         let change = ui::vfo(ui, down, 34.0, TX());
-                        ui.label(RichText::new(format!("UPLINK {:.5} MHz", uplink / 1e6)).monospace().size(13.0).color(TX().gamma_multiply(0.75)));
+                        let how = if self.linked { self.t("LINKED", "BAĞLI").to_string() } else { format!("SHIFT {:+.2} kHz", shift / 1e3) };
+                        let state = if transmitting { self.t(" · ON AIR", " · YAYINDA") } else { "" };
+                        ui.label(RichText::new(format!("UPLINK {:.5} MHz · {how}{state}", uplink / 1e6)).monospace().size(13.0).color(TX().gamma_multiply(0.75)));
                         change
                     })
                 })
@@ -880,19 +904,6 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            for m in MODES {
-                if ui::choice(ui, m.name(), self.mode == m && self.digital.is_none(), RX()) {
-                    self.set_digital(None);
-                    self.mode = m;
-                }
-            }
-            for p in [&FT8, &FT4] {
-                let on = self.digital.is_some_and(|d| std::ptr::eq(d, p));
-                if ui::choice(ui, p.name, on, RX()) && !on {
-                    self.set_digital(Some(p));
-                }
-            }
-            ui.add_space(12.0);
             let lock = if self.auto_lock { self.t("Lock: automatic", "Kilit: otomatik") } else { self.t("Lock: manual", "Kilit: elle") };
             if ui::choice(ui, lock, self.auto_lock, BLUE()) {
                 self.auto_lock = !self.auto_lock;
@@ -970,7 +981,7 @@ impl App {
         for (a, b) in bandplan::RESERVED_HZ {
             let r = Rect::from_min_max(pos2(x_of(a).max(rect.left()), spec.top()), pos2(x_of(b).min(rect.right()), spec.bottom()));
             if r.width() > 0.0 {
-                painter.rect_filled(r, CornerRadius::ZERO, TX().gamma_multiply(0.08));
+                painter.rect_filled(r, CornerRadius::ZERO, ALERT().gamma_multiply(0.08));
             }
         }
         // Frequency grid and axis.
@@ -994,11 +1005,11 @@ impl App {
                 continue;
             }
             let color = match use_ {
-                bandplan::Use::Beacon => TX(),
+                bandplan::Use::Beacon => ALERT(),
                 bandplan::Use::Cw => GOOD(),
                 bandplan::Use::Digital => BLUE(),
                 bandplan::Use::Mixed => MUTED(),
-                bandplan::Use::Ssb => RX(),
+                bandplan::Use::Ssb => TX(),
             };
             let r = Rect::from_min_max(pos2(x0, strip.top() + 2.0), pos2(x1, strip.bottom() - 1.0)).shrink2(vec2(1.0, 0.0));
             painter.rect_filled(r, CornerRadius::same(3), color.gamma_multiply(0.22));
@@ -1032,10 +1043,13 @@ impl App {
             let points: Vec<egui::Pos2> =
                 self.line.iter().enumerate().map(|(i, &v)| pos2(rect.left() + (i as f32 + 0.5) / n as f32 * rect.width(), y_of(v))).collect();
             let mut mesh = egui::Mesh::default();
-            let fill = BLUE().gamma_multiply(0.14);
+            // Brightest under the peaks, fading to the foot: the depth of a real display.
+            let (top, foot) = (BLUE().gamma_multiply(0.5), BLUE().gamma_multiply(0.04));
+            let span = spec.height().max(1.0);
             for p in &points {
-                mesh.colored_vertex(*p, fill);
-                mesh.colored_vertex(pos2(p.x, spec.bottom()), fill);
+                let t = ((spec.bottom() - p.y) / span).clamp(0.0, 1.0);
+                mesh.colored_vertex(*p, foot.lerp_to_gamma(top, 0.25 + 0.75 * t));
+                mesh.colored_vertex(pos2(p.x, spec.bottom()), foot);
             }
             for i in 0..(n as u32 - 1) {
                 let k = i * 2;
@@ -1043,7 +1057,7 @@ impl App {
                 mesh.add_triangle(k + 1, k + 3, k + 2);
             }
             painter.add(egui::Shape::mesh(mesh));
-            painter.add(egui::Shape::line(points, Stroke::new(1.2, BLUE())));
+            painter.add(egui::Shape::line(points, Stroke::new(1.5, BLUE())));
         }
         // FT8 segment marker.
         let ft = x_of(FT_DIAL_HZ);
@@ -1206,8 +1220,8 @@ impl App {
             Some(Err(e)) => format!("{}: {e}", self.t("No microphone", "Mikrofon yok")),
             None => String::new(),
         };
-        ui.label(RichText::new(mic_text).size(11.0).color(if matches!(mic, Some(Err(_))) { TX() } else { MUTED() }));
-        let bar_color = if status.vox_keyed { TX() } else { GOOD() };
+        ui.label(RichText::new(mic_text).size(11.0).color(if matches!(mic, Some(Err(_))) { ALERT() } else { MUTED() }));
+        let bar_color = if status.vox_keyed { ALERT() } else { GOOD() };
         ui::level_bar(ui, ui.available_width(), status.mic_db, (-70.0, 0.0), bar_color, Some(self.vox.threshold_db));
         egui::Grid::new("vox").num_columns(2).spacing(vec2(10.0, 3.0)).show(ui, |ui| {
             ui.label(RichText::new(self.t("Threshold", "Eşik")).size(12.0));
@@ -1247,7 +1261,7 @@ impl App {
         let can = matches!(self.tx_capable, Some(Ok(())));
         ui.vertical_centered(|ui| {
             let (arm_text, arm_color) =
-                if self.armed { (self.t("TX enabled", "TX etkin"), TX()) } else { (self.t("TX disabled", "TX kapalı"), MUTED()) };
+                if self.armed { (self.t("TX enabled", "TX etkin"), ALERT()) } else { (self.t("TX disabled", "TX kapalı"), MUTED()) };
             if ui::choice(ui, arm_text, self.armed, arm_color) && can {
                 self.armed = !self.armed;
                 if !self.armed {
@@ -1261,7 +1275,7 @@ impl App {
                 } else {
                     format!("{}: {why}", self.t("Receive only", "Yalnızca alıcı"))
                 };
-                ui.label(RichText::new(text).size(11.0).color(RX()));
+                ui.label(RichText::new(text).size(11.0).color(TX()));
             }
             ui.add_space(2.0);
             ui.label(RichText::new(self.t("Output power", "Çıkış gücü")).size(11.0).color(MUTED()));
@@ -1286,7 +1300,7 @@ impl App {
                 None if self.mode == Mode::Cw => self.t("A steady carrier on the dial", "Dinleme frekansında sabit bir taşıyıcı"),
                 None => self.t("A steady tone 1 kHz above the dial", "Dinleme frekansının 1 kHz üstünde sabit bir ton"),
             };
-            if ui::choice_response(ui, "Tune", self.tune, TX()).on_hover_text(tip).clicked() && can && self.armed {
+            if ui::choice_response(ui, "Tune", self.tune, ALERT()).on_hover_text(tip).clicked() && can && self.armed {
                 self.tune = !self.tune;
             }
             // In FT8/FT4 the sequence keys the transmitter, in CW the keyer: no PTT.
@@ -1296,7 +1310,7 @@ impl App {
                 }
             } else {
                 let text = if on { "TX" } else { "RX" };
-                let color = if on { TX() } else { DIM() };
+                let color = if on { ALERT() } else { DIM() };
                 ui.label(RichText::new(text).size(28.0).strong().color(color));
             }
             let state = match status.state {
@@ -1314,9 +1328,9 @@ impl App {
                 TxState::Blocked(b) => self.blocked_text(b).to_string(),
             };
             let color = match status.state {
-                TxState::Transmit => TX(),
+                TxState::Transmit => ALERT(),
                 TxState::Receive => GOOD(),
-                TxState::Blocked(_) => RX(),
+                TxState::Blocked(_) => TX(),
             };
             ui.label(RichText::new(state).size(12.0).color(color));
             let rate = self.config.tx_rate();
@@ -1327,7 +1341,7 @@ impl App {
                     status.sent_rate / 1e6,
                     rate / 1e6
                 );
-                ui.label(RichText::new(text).size(11.0).color(TX()));
+                ui.label(RichText::new(text).size(11.0).color(ALERT()));
             }
             let mode = if self.auto_uplink { self.t("auto", "oto") } else { self.t("manual", "elle") };
             let mut line = format!("{} {:+.0} Hz · {mode}", self.t("Uplink corr.", "Uplink düz."), self.tx_correction);
@@ -1339,7 +1353,7 @@ impl App {
                 "Yayın yaparken kendi sinyaliniz downlink'te bulunur (ses ya da ton) ve uplink kayma kadar düzeltilir",
             ));
             if let Some(e) = &status.error {
-                ui.label(RichText::new(e).size(11.0).color(TX()));
+                ui.label(RichText::new(e).size(11.0).color(ALERT()));
             }
         });
     }
@@ -1356,7 +1370,7 @@ impl App {
             });
         });
         if !self.armed {
-            ui.label(RichText::new(self.t("Switch TX on (right) to send", "Göndermek için sağdaki TX'i açın")).size(11.0).color(RX()));
+            ui.label(RichText::new(self.t("Switch TX on (right) to send", "Göndermek için sağdaki TX'i açın")).size(11.0).color(TX()));
         }
         // Text: Enter sends it.
         let hint = self.t("Text to send, Enter", "Gönderilecek metin, Enter");
@@ -1391,7 +1405,7 @@ impl App {
         let left = keyer.lock().unwrap().text_left();
         if left > 0 {
             let secs = left as f64 * 1.2 / self.cw_wpm;
-            ui.label(RichText::new(format!("{} · {secs:.0} s", self.t("Sending", "Gönderiliyor"))).size(11.0).color(TX()));
+            ui.label(RichText::new(format!("{} · {secs:.0} s", self.t("Sending", "Gönderiliyor"))).size(11.0).color(ALERT()));
         }
         ui.add_space(4.0);
         // The keys: held with the mouse (or [ ] and Space on the keyboard).
@@ -1520,7 +1534,7 @@ impl App {
                 }
                 small(ui, self.t("Network: ip:192.168.2.1 · USB: usb:1.2.5", "Ağ: ip:192.168.2.1 · USB: usb:1.2.5").into(), DIM());
                 if let Err(e) = iio::library_status() {
-                    small(ui, format!("libiio: {e}"), TX());
+                    small(ui, format!("libiio: {e}"), ALERT());
                 }
             }
             RadioKind::RtlUsb => {
@@ -1537,7 +1551,7 @@ impl App {
                     }
                 }
                 match qo_all::rtlsdr::library_status() {
-                    Err(e) => small(ui, format!("librtlsdr: {e}"), TX()),
+                    Err(e) => small(ui, format!("librtlsdr: {e}"), ALERT()),
                     Ok(()) if cfg!(windows) => small(ui, self.t("Windows: the dongle needs the WinUSB driver (Zadig)", "Windows: cihaz için WinUSB sürücüsü gerekir (Zadig)").into(), DIM()),
                     Ok(()) => {}
                 }
@@ -1564,7 +1578,7 @@ impl App {
                     }
                 }
                 if let Err(e) = qo_all::hackrf::library_status() {
-                    small(ui, format!("libhackrf: {e}"), TX());
+                    small(ui, format!("libhackrf: {e}"), ALERT());
                 }
             }
         }
@@ -1573,7 +1587,7 @@ impl App {
         if device.can_transmit() {
             let mut on = self.edit_tx_enabled;
             let label = self.t("TX enabled (transmit with this radio)", "TX etkin (bu cihazla yayın yap)");
-            let color = if on { TX() } else { TEXT() };
+            let color = if on { ALERT() } else { TEXT() };
             if ui.checkbox(&mut on, RichText::new(label).color(color)).changed() {
                 if on {
                     self.tx_warning = true;
@@ -1606,7 +1620,7 @@ impl App {
         let mut answer = None;
         egui::Modal::new(egui::Id::new("tx_warning")).show(ctx, |ui| {
             ui.set_max_width(420.0);
-            ui.label(RichText::new(self.t("Transmit with this radio?", "Bu cihazla yayın yapılsın mı?")).size(17.0).strong().color(TX()));
+            ui.label(RichText::new(self.t("Transmit with this radio?", "Bu cihazla yayın yapılsın mı?")).size(17.0).strong().color(ALERT()));
             ui.add_space(6.0);
             ui.label(self.t(
                 "Make sure an antenna (or a dummy load) is connected to the TX output and its SWR is good, and that the amplifier after it is set up. Transmitting into an open or badly matched output can damage the radio and the amplifier.",
@@ -1614,7 +1628,7 @@ impl App {
             ));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new(self.t("Yes, the antenna is connected", "Evet, anten bağlı")).color(BG())).fill(TX())).clicked() {
+                if ui.add(egui::Button::new(RichText::new(self.t("Yes, the antenna is connected", "Evet, anten bağlı")).color(BG())).fill(ALERT())).clicked() {
                     answer = Some(true);
                 }
                 if ui.button(self.t("Cancel", "Vazgeç")).clicked() {
@@ -1699,7 +1713,7 @@ impl App {
             ui.label(RichText::new(text).size(11.0).color(GOOD()));
         }
         for e in &self.serial.errors {
-            ui.label(RichText::new(e).size(11.0).color(TX()));
+            ui.label(RichText::new(e).size(11.0).color(ALERT()));
         }
     }
 

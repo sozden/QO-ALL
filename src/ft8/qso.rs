@@ -5,6 +5,8 @@
 //! Tx5 "DX ME 73" (logged). Calling CQ: Tx6 "CQ ME GRID" → their grid → Tx2
 //! "DX ME -05" → their R-report → Tx4 "DX ME RR73" (logged).
 
+use super::message::is_standard_call;
+
 /// What a message says after the two calls.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Payload {
@@ -157,11 +159,34 @@ impl Sequencer {
         }
     }
 
-    /// Text of a message with the current partner.
+    /// Text of a message with the current partner. A non-standard call (a prefix such as
+    /// C9/ZS6WAB) goes as WSJT-X sends it: hashed in <> beside a standard call, or in a
+    /// type 4 message without grid or report when it is our own.
     pub fn message(&self, step: Step) -> String {
         let me = &self.my_call;
         let dx = self.dx.as_ref().map_or("DX", |d| d.call.as_str());
         let rpt = format_report(self.dx.as_ref().and_then(|d| d.sent).unwrap_or(-10));
+        let (me_std, dx_std) = (is_standard_call(me), dx == "DX" || is_standard_call(dx));
+        if me_std && !dx_std {
+            return match step {
+                Step::Tx1 => format!("<{dx}> {me} {}", self.my_grid),
+                Step::Tx2 => format!("<{dx}> {me} {rpt}"),
+                Step::Tx3 => format!("<{dx}> {me} R{rpt}"),
+                Step::Tx4 => format!("<{dx}> {me} RR73"),
+                Step::Tx5 => format!("<{dx}> {me} 73"),
+                Step::Tx6 => format!("CQ {me} {}", self.my_grid),
+            };
+        }
+        if !me_std && dx_std {
+            return match step {
+                Step::Tx1 => format!("<{dx}> {me}"),
+                Step::Tx2 => format!("{dx} <{me}> {rpt}"),
+                Step::Tx3 => format!("{dx} <{me}> R{rpt}"),
+                Step::Tx4 => format!("<{dx}> {me} RR73"),
+                Step::Tx5 => format!("<{dx}> {me} 73"),
+                Step::Tx6 => format!("CQ {me}"),
+            };
+        }
         match step {
             Step::Tx1 => format!("{dx} {me} {}", self.my_grid),
             Step::Tx2 => format!("{dx} {me} {rpt}"),
@@ -391,6 +416,30 @@ mod tests {
         s.heard(&[heard("TA4SO EA7HJ IM76", -5, true)], 150);
         assert_eq!((s.dx.as_ref().unwrap().call.as_str(), s.next, s.done), ("EA7HJ", Step::Tx2, false));
         assert_eq!(s.message(Step::Tx2), "EA7HJ TA4SO -05");
+    }
+
+    #[test]
+    fn non_standard_calls_as_wsjtx_sends_them() {
+        let mut s = Sequencer::new("TA4SO", "KM47");
+        assert!(s.pick(&heard("CQ C9/ZS6WAB", -3, false), 0));
+        let all: Vec<String> = Step::ALL.iter().map(|&st| s.message(st)).collect();
+        assert_eq!(all, ["<C9/ZS6WAB> TA4SO KM47", "<C9/ZS6WAB> TA4SO -03", "<C9/ZS6WAB> TA4SO R-03", "<C9/ZS6WAB> TA4SO RR73", "<C9/ZS6WAB> TA4SO 73", "CQ TA4SO KM47"]);
+        for m in &all {
+            assert!(crate::ft8::message::pack(m).is_some(), "{m}");
+        }
+        // Their report with our call plain and theirs hashed goes on as usual.
+        s.heard(&[heard("TA4SO <C9/ZS6WAB> -07", -4, false)], 15);
+        assert_eq!(s.next, Step::Tx3);
+
+        let mut s = Sequencer::new("TA4SO/MM", "KM47");
+        s.pick(&heard("CQ DL1ABC JO62", -8, false), 0);
+        let all: Vec<String> = Step::ALL.iter().map(|&st| s.message(st)).collect();
+        assert_eq!(all, ["<DL1ABC> TA4SO/MM", "DL1ABC <TA4SO/MM> -08", "DL1ABC <TA4SO/MM> R-08", "<DL1ABC> TA4SO/MM RR73", "<DL1ABC> TA4SO/MM 73", "CQ TA4SO/MM"]);
+        for m in &all {
+            assert!(crate::ft8::message::pack(m).is_some(), "{m}");
+        }
+        s.heard(&[heard("<TA4SO/MM> DL1ABC -05", -8, false)], 15);
+        assert_eq!(s.next, Step::Tx3);
     }
 
     #[test]

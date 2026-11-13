@@ -296,14 +296,50 @@ pub fn pack28(call: &str) -> Option<u32> {
     Some(n + NTOKENS + MAX22)
 }
 
-/// A standard message (type 1) as 77 bits: "CQ K1ABC FN42", "K1ABC W9XYZ -11",
-/// "K1ABC W9XYZ R-09", "K1ABC W9XYZ RR73", "K1ABC W9XYZ 73", "K1ABC W9XYZ RRR".
+/// Whether a call sign fits a standard message (28 bits, with /P or /R allowed).
+pub fn is_standard_call(call: &str) -> bool {
+    let c = call.trim().to_ascii_uppercase();
+    let base = c.strip_suffix("/P").or_else(|| c.strip_suffix("/R")).unwrap_or(&c);
+    pack28(base).is_some()
+}
+
+/// A call field of a standard message: 28 bits and the /R or /P flag. "<CALL>" is sent
+/// as its 22-bit hash (a non-standard call beside a standard one).
+fn pack_call_field(word: &str) -> Option<(u32, Option<char>)> {
+    if let Some(inner) = word.strip_prefix('<').and_then(|w| w.strip_suffix('>')) {
+        if inner.is_empty() || inner.len() > 11 || !inner.bytes().all(|b| HASH_CHARS.contains(&b) && b != b' ') {
+            return None;
+        }
+        return Some((NTOKENS + hash_call(inner, 22), None));
+    }
+    for (suffix, flag) in [("/R", 'R'), ("/P", 'P')] {
+        if let Some(base) = word.strip_suffix(suffix) {
+            return pack28(base).map(|n| (n, Some(flag)));
+        }
+    }
+    pack28(word).map(|n| (n, None))
+}
+
+/// A standard message (type 1, or 2 with /P calls) as 77 bits: "CQ K1ABC FN42",
+/// "K1ABC W9XYZ -11", "K1ABC W9XYZ R-09", "K1ABC W9XYZ RR73", "K1ABC W9XYZ 73",
+/// "K1ABC W9XYZ RRR", "<PJ4/K1ABC> W9XYZ EN37", "G4ABC/P W9XYZ -05".
 pub fn pack_standard(text: &str) -> Option<Vec<u8>> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let (a, b, rest) = match words.as_slice() {
         [a, b] => (*a, *b, ""),
         [a, b, r] => (*a, *b, *r),
         _ => return None,
+    };
+    let (na, fa) = pack_call_field(a)?;
+    let (nb, fb) = pack_call_field(b)?;
+    // Both calls hashed says nothing; /R and /P cannot be mixed.
+    if a.starts_with('<') && b.starts_with('<') {
+        return None;
+    }
+    let i3 = match (fa, fb) {
+        (Some('R'), Some('P')) | (Some('P'), Some('R')) => return None,
+        (Some('P'), _) | (_, Some('P')) => 2,
+        _ => 1,
     };
     let (mut r, mut tail) = (false, rest);
     if let Some(t) = tail.strip_prefix('R').filter(|t| t.starts_with('-') || t.starts_with('+')) {
@@ -322,20 +358,71 @@ pub fn pack_standard(text: &str) -> Option<Vec<u8>> {
         }
         t if t.len() == 4 => {
             let c = t.as_bytes();
+            if !(b'A'..=b'R').contains(&c[0]) || !(b'A'..=b'R').contains(&c[1]) || !c[2].is_ascii_digit() || !c[3].is_ascii_digit() {
+                return None;
+            }
             (c[0] - b'A') as u32 * 1800 + (c[1] - b'A') as u32 * 100 + (c[2] - b'0') as u32 * 10 + (c[3] - b'0') as u32
         }
         _ => return None,
     };
     let mut bits = Vec::with_capacity(77);
     let mut push = |v: u64, n: usize| bits.extend((0..n).rev().map(|i| ((v >> i) & 1) as u8));
-    push(pack28(a)? as u64, 28);
-    push(0, 1);
-    push(pack28(b)? as u64, 28);
-    push(0, 1);
+    push(na as u64, 28);
+    push(fa.is_some() as u64, 1);
+    push(nb as u64, 28);
+    push(fb.is_some() as u64, 1);
     push(r as u64, 1);
     push(g as u64, 15);
-    push(1, 3);
+    push(i3, 3);
     Some(bits)
+}
+
+/// A message with one non-standard call sign (type 4): "CQ PJ4/K1ABC",
+/// "<W9XYZ> PJ4/K1ABC", "PJ4/K1ABC <W9XYZ> RR73", "<W9XYZ> PJ4/K1ABC 73". The other call
+/// goes as its 12-bit hash; no grid or report fits.
+pub fn pack_nonstandard(text: &str) -> Option<Vec<u8>> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let hashed = |w: &str| w.strip_prefix('<').and_then(|w| w.strip_suffix('>')).filter(|w| !w.is_empty()).map(str::to_string);
+    let (h, call, flip, nrpt, cq) = match words.as_slice() {
+        ["CQ", c] if !c.starts_with('<') => (String::new(), *c, false, 0, true),
+        [a, b, tail @ ..] if tail.len() <= 1 => {
+            let nrpt = match tail.first().copied() {
+                None => 0,
+                Some("RRR") => 1,
+                Some("RR73") => 2,
+                Some("73") => 3,
+                _ => return None,
+            };
+            match (hashed(a), hashed(b)) {
+                (Some(h), None) => (h, *b, false, nrpt, false),
+                (None, Some(h)) => (h, *a, true, nrpt, false),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if call.len() > 11 || call.is_empty() {
+        return None;
+    }
+    let mut n58: u64 = 0;
+    for c in format!("{call:>11}").bytes() {
+        n58 = n58 * 38 + HASH_CHARS.iter().position(|&x| x == c)? as u64;
+    }
+    let mut bits = Vec::with_capacity(77);
+    let mut push = |v: u64, n: usize| bits.extend((0..n).rev().map(|i| ((v >> i) & 1) as u8));
+    push(if cq { 0 } else { hash_call(&h, 12) } as u64, 12);
+    push(n58, 58);
+    push(flip as u64, 1);
+    push(nrpt, 2);
+    push(cq as u64, 1);
+    push(4, 3);
+    Some(bits)
+}
+
+/// Any message we send: standard, one non-standard call, or free text.
+pub fn pack(text: &str) -> Option<Vec<u8>> {
+    let t = text.trim().to_ascii_uppercase();
+    pack_standard(&t).or_else(|| pack_nonstandard(&t)).or_else(|| pack_text(&t))
 }
 
 /// Free text (up to 13 characters of TEXT_CHARS) as 77 bits.
@@ -385,6 +472,30 @@ mod tests {
         // All 13 characters used: the value needs all 71 bits (once lost above 64 bits).
         let bits = pack_text("ZZZZZZZZZZZZZ").unwrap();
         assert_eq!(unpack(&bits, &mut book).as_deref(), Some("ZZZZZZZZZZZZZ"));
+    }
+
+    #[test]
+    fn non_standard_calls_round_trip() {
+        let mut book = CallBook::default();
+        book.remember("TA4SO");
+        // The other side has heard the CQ, so both hashes are known.
+        for text in ["CQ C9/ZS6WAB", "<TA4SO> C9/ZS6WAB", "C9/ZS6WAB <TA4SO> RR73", "<TA4SO> C9/ZS6WAB 73"] {
+            let bits = pack(text).expect(text);
+            assert_eq!(bits.len(), 77);
+            assert_eq!(unpack(&bits, &mut book).as_deref(), Some(text));
+        }
+        for text in ["<C9/ZS6WAB> TA4SO KM47", "<C9/ZS6WAB> TA4SO -03", "<C9/ZS6WAB> TA4SO R-03", "<C9/ZS6WAB> TA4SO RR73", "TA4SO <C9/ZS6WAB> +02"] {
+            let bits = pack_standard(text).expect(text);
+            assert_eq!(unpack(&bits, &mut book).as_deref(), Some(text));
+        }
+        for text in ["G4ABC/P TA4SO -05", "TA4SO W1AW/R R-11"] {
+            let bits = pack_standard(text).expect(text);
+            assert_eq!(unpack(&bits, &mut book).as_deref(), Some(text));
+        }
+        assert!(!is_standard_call("C9/ZS6WAB"));
+        assert!(is_standard_call("G4ABC/P") && is_standard_call("TA4SO"));
+        assert!(pack_standard("C9/ZS6WAB TA4SO KM47").is_none());
+        assert!(pack("C9/ZS6WAB TA4SO KM47").is_none(), "too long for free text too");
     }
 
     #[test]

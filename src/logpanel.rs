@@ -320,7 +320,7 @@ impl LogPanel {
             }
             ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(110.0).hint_text(t("search call", "çağrı ara")));
             if !self.status.is_empty() {
-                ui.label(RichText::new(&self.status).size(11.0).color(RX()));
+                ui.label(RichText::new(&self.status).size(11.0).color(TX()));
             }
         });
         let filter = self.filter.trim().to_ascii_uppercase();
@@ -423,7 +423,7 @@ impl LogPanel {
             }
             if let Editing::Record(i) = which {
                 let label = if self.delete_asked { t("Delete for good?", "Kesin silinsin mi?") } else { t("Delete", "Sil") };
-                if ui::choice(ui, label, self.delete_asked, TX()) {
+                if ui::choice(ui, label, self.delete_asked, ALERT()) {
                     if self.delete_asked {
                         self.delete(i, tr);
                         self.editing = None;
@@ -433,7 +433,7 @@ impl LogPanel {
                 }
             }
             if !self.status.is_empty() {
-                ui.label(RichText::new(&self.status).size(11.0).color(RX()));
+                ui.label(RichText::new(&self.status).size(11.0).color(TX()));
             }
         });
         if let Some((_, f)) = self.editing.as_mut() {

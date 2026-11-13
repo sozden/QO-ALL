@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1 — 2026-11-13
+
+- **Calls with a prefix in FT8/FT4**: a station such as C9/ZS6WAB can be answered. Its
+  call goes as WSJT-X sends it, hashed in angle brackets beside ours
+  (`<C9/ZS6WAB> TA4SO KM47`); before, the message could not be encoded and nothing was
+  sent. With a non-standard call of our own (TA4SO/MM) CQ, Tx1, RR73 and 73 go as type 4
+  messages and the reports with our call hashed. Calls with /P and /R can be sent too.
+- **Calmer, clearer window**: the modes (USB, CW, FT8, FT4) as one row of keys at the
+  top; receive in blue, transmit in amber, red kept for being on the air, errors and
+  the beacons; a line of the role's colour on the receive and transmit displays, the
+  signal in figures under the receive frequency (S units, dBm, S/N), the uplink, linked
+  or shift and "ON AIR" under the transmit one; the spectrum filled brighter under the
+  peaks.
+
 ## 0.7.0 — 2026-11-12
 
 - **S-meter**: a classic needle meter beside the receive frequency, S1–S9 and +10…+60 dB
